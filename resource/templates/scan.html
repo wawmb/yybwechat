@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="yybwechat — 扫码添加微信账号">
+  <title>扫码添加账号 · yybwechat</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: oklch(1 0 0);
+      --bg-soft: oklch(0.974 0.004 250);
+      --surface: oklch(0.986 0.004 250);
+      --surface-strong: oklch(0.948 0.009 250);
+      --ink: oklch(0.19 0.025 252);
+      --muted: oklch(0.43 0.025 252);
+      --faint: oklch(0.58 0.018 252);
+      --line: oklch(0.885 0.012 250);
+      --primary: oklch(0.54 0.205 3);
+      --primary-hover: oklch(0.48 0.195 3);
+      --accent: oklch(0.44 0.112 190);
+      --success: oklch(0.55 0.135 145);
+      --success-soft: oklch(0.94 0.035 145);
+      --warning: oklch(0.68 0.135 78);
+      --danger: oklch(0.55 0.18 25);
+      --radius: 10px;
+    }
+
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: oklch(0.18 0.018 252);
+      --bg-soft: oklch(0.15 0.014 252);
+      --surface: oklch(0.21 0.019 252);
+      --surface-strong: oklch(0.26 0.022 252);
+      --ink: oklch(0.94 0.008 250);
+      --muted: oklch(0.68 0.018 252);
+      --faint: oklch(0.52 0.016 252);
+      --line: oklch(0.30 0.018 252);
+      --primary: oklch(0.65 0.20 3);
+      --primary-hover: oklch(0.58 0.19 3);
+      --accent: oklch(0.62 0.14 190);
+      --success: oklch(0.65 0.14 145);
+      --success-soft: oklch(0.26 0.04 145);
+      --warning: oklch(0.72 0.14 78);
+      --danger: oklch(0.65 0.18 25);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { height: 100%; }
+
+    body {
+      min-height: 100%; display: grid; place-items: center;
+      background: var(--bg-soft); color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 14px; line-height: 1.5;
+      padding: 20px;
+    }
+
+    button { font: inherit; cursor: pointer; }
+
+    .card {
+      width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line);
+      border-radius: var(--radius); box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow: hidden;
+    }
+
+    .card-header {
+      padding: 28px 28px 0; text-align: center;
+    }
+
+    .card-header h2 {
+      font-size: 20px; font-weight: 760; letter-spacing: -0.01em;
+    }
+
+    .card-header p {
+      margin-top: 6px; color: var(--muted); font-size: 13px;
+    }
+
+    .card-body {
+      padding: 24px 28px 28px; display: grid; gap: 20px;
+    }
+
+    /* ---- QR area ---- */
+    .qr-wrapper {
+      width: 220px; height: 220px; margin: 0 auto;
+      border: 1px solid var(--line); border-radius: var(--radius);
+      display: grid; place-items: center; overflow: hidden;
+      background: var(--surface); position: relative;
+    }
+    .qr-wrapper img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .qr-wrapper .qr-placeholder {
+      color: var(--faint); font-size: 13px; text-align: center; padding: 20px; line-height: 1.5;
+    }
+    .qr-wrapper .qr-spinner {
+      width: 32px; height: 32px; border: 3px solid var(--line); border-top-color: var(--primary);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+    }
+    .qr-overlay {
+      position: absolute; inset: 0; display: grid; place-items: center;
+      background: var(--surface); opacity: 0; pointer-events: none; transition: opacity 300ms ease;
+    }
+    .qr-overlay.active { opacity: 1; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---- status ---- */
+    .status-bar {
+      text-align: center; min-height: 52px; display: grid; place-items: center; gap: 6px;
+    }
+    .status-text { font-size: 14px; font-weight: 680; transition: color 300ms ease; }
+    .status-text.pending { color: var(--muted); }
+    .status-text.scanned { color: var(--accent); }
+    .status-text.authorized, .status-text.success { color: var(--success); }
+    .status-text.error { color: var(--danger); }
+
+    .status-anim { display: flex; align-items: center; justify-content: center; gap: 4px; }
+    .status-anim .dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--muted);
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    .status-anim .dot:nth-child(2) { animation-delay: 0.2s; }
+    .status-anim .dot:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes pulse { 0%,80%,100% { opacity: 0.3; transform: scale(0.75); } 40% { opacity: 1; transform: scale(1); } }
+
+    .countdown {
+      text-align: center; font-size: 12px; color: var(--faint);
+      min-height: 16px; font-variant-numeric: tabular-nums;
+    }
+    .countdown.expiring { color: var(--danger); font-weight: 680; }
+
+    /* ---- success info ---- */
+    .result-box {
+      background: var(--success-soft); border: 1px solid var(--success);
+      border-radius: var(--radius); padding: 14px;       display: none; text-align: left;
+      font-size: 13px; grid-template-columns: 1fr; gap: 8px;
+    }
+    .result-box.show { display: grid; }
+    .result-box .result-head { display: flex; align-items: center; gap: 8px; }
+    .result-box .result-icon { font-size: 20px; }
+    .result-box .result-title { font-weight: 760; color: var(--success); }
+    .result-box .result-meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+
+    /* ---- buttons ---- */
+    .btn {
+      min-height: 38px; border: 1px solid transparent; border-radius: var(--radius);
+      padding: 8px 18px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      font-weight: 680; transition: background 160ms ease, border-color 160ms ease, color 160ms ease, opacity 160ms ease;
+      text-decoration: none;
+    }
+    .btn.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+    .btn.secondary { border-color: var(--line); background: var(--bg); color: var(--ink); }
+    .btn.secondary:hover { background: var(--surface-strong); }
+    .btn:disabled { cursor: not-allowed; opacity: 0.55; }
+
+    .btn-row {
+      display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="card-header">
+      <h2>扫码添加账号</h2>
+      <p>使用<strong>手机微信扫一扫</strong>扫描二维码并确认登录</p>
+    </div>
+
+    <div class="card-body">
+      <!-- QR -->
+      <div class="qr-wrapper" id="qrWrap">
+        <div class="qr-placeholder">
+          <div class="qr-spinner" style="margin:0 auto 10px"></div>
+          生成中…
+        </div>
+        <div class="qr-overlay" id="qrOverlay"><span style="font-size:40px">✓</span></div>
+      </div>
+
+      <!-- Status -->
+      <div class="status-bar">
+        <div class="status-text pending" id="statusText">正在获取二维码…</div>
+        <div class="status-anim hidden" id="statusAnim">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        </div>
+      </div>
+
+      <!-- Countdown -->
+      <div class="countdown" id="countdown"></div>
+
+      <!-- Success result -->
+      <div class="result-box" id="resultBox">
+        <div class="result-head"><span class="result-icon">✅</span><span class="result-title">添加成功</span></div>
+        <div class="result-meta" id="resultMeta"></div>
+      </div>
+
+      <!-- Actions -->
+      <div class="btn-row">
+        <button class="btn primary" id="refreshBtn">🔄 重新生成</button>
+        <a class="btn secondary" href="/">← 返回首页</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const QR_TTL = 180; // 倒计时展示用，服务端实际会话有效期见 QRSessionTTL (5min)
+    let sid = null, pollTimer = null, cdTimer = null, secsLeft = 0, confirming = false, settleTimer = null;
+
+    function escapeHTML(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+    }
+
+    // ---- theme ----
+    (function() {
+      const saved = localStorage.getItem("yybwechat-theme");
+      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      if (saved === "dark" || (!saved && prefersDark)) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+
+    // ---- API ----
+    async function api(method, url) {
+      const r = await fetch(url, { method });
+      const t = await r.text();
+      let d; try { d = t ? JSON.parse(t) : null; } catch { d = t; }
+      const isEnv = d && typeof d === "object" && !Array.isArray(d)
+        && Object.prototype.hasOwnProperty.call(d, "code")
+        && Object.prototype.hasOwnProperty.call(d, "msg")
+        && Object.prototype.hasOwnProperty.call(d, "data");
+      if (!r.ok || (isEnv && d.code !== 0)) {
+        throw { status: r.status, message: isEnv ? d.msg : ("HTTP " + r.status), data: isEnv ? d.data : d };
+      }
+      return isEnv ? d.data : d;
+    }
+
+    function setStatus(text, cls, showAnim) {
+      const st = $("statusText");
+      st.textContent = text;
+      st.className = "status-text " + (cls || "pending");
+
+      const anim = $("statusAnim");
+      if (showAnim) {
+        anim.classList.remove("hidden");
+        anim.querySelectorAll(".dot").forEach(d => d.style.background =
+          cls === "scanned" ? "var(--accent)" : "var(--muted)");
+      } else {
+        anim.classList.add("hidden");
+      }
+    }
+
+    function stopTimers() {
+      if (pollTimer) clearInterval(pollTimer);
+      if (cdTimer) clearInterval(cdTimer);
+      if (settleTimer) clearTimeout(settleTimer);
+      pollTimer = cdTimer = settleTimer = null;
+    }
+
+    function startCountdown() {
+      secsLeft = QR_TTL;
+      $("countdown").textContent = `有效期 ${secsLeft}s`;
+      $("countdown").classList.remove("expiring");
+      cdTimer = setInterval(() => {
+        secsLeft--;
+        if (secsLeft <= 15) $("countdown").classList.add("expiring");
+        $("countdown").textContent = secsLeft > 0 ? `有效期 ${secsLeft}s` : "已过期，刷新中…";
+        if (secsLeft <= 0) { stopTimers(); newQR(); }
+      }, 1000);
+    }
+
+    function showQR(qrUrl) {
+      $("qrWrap").innerHTML =
+        `<img src="${qrUrl}?t=${Date.now()}" alt="二维码">` +
+        `<div class="qr-overlay" id="qrOverlay"><span style="font-size:40px">✓</span></div>`;
+    }
+
+    function showSuccess(account) {
+      const overlay = $("qrOverlay");
+      if (overlay) overlay.classList.add("active");
+      setStatus("添加成功", "success", false);
+      $("countdown").textContent = "";
+
+      const name = escapeHTML(account.nickname || account.alias || account.openid);
+      $("resultMeta").innerHTML = `
+        <div>昵称：${name}</div>
+        <div>openid：${escapeHTML(account.openid)}</div>
+        <div>状态：${escapeHTML(account.status === "alive" ? "可用" : account.status === "expired" ? "需重扫" : account.status)}</div>`;
+      $("resultBox").classList.add("show");
+    }
+
+    function resetUI() {
+      const overlay = $("qrOverlay");
+      if (overlay) overlay.classList.remove("active");
+      $("resultBox").classList.remove("show");
+      $("qrWrap").innerHTML = `<div class="qr-placeholder"><div class="qr-spinner" style="margin:0 auto 10px"></div>生成中…</div>`;
+      $("countdown").textContent = "";
+      $("countdown").classList.remove("expiring");
+    }
+
+    async function newQR() {
+      if (confirming) return;
+      stopTimers();
+      resetUI();
+      setStatus("正在获取二维码…", "pending", false);
+
+      try {
+        const r = await api("POST", "/qr");
+        sid = r.session_id;
+        showQR(r.image_url);
+        setStatus("等待扫码", "pending", true);
+        startCountdown();
+        pollTimer = setInterval(poll, 1500);
+      } catch (e) {
+        setStatus("获取失败：" + (e.message || "未知错误"), "error", false);
+      }
+    }
+
+    async function poll() {
+      if (!sid || confirming) return;
+      let st;
+      try { st = await api("GET", `/qr/${sid}/poll`); } catch { return; }
+
+      switch (st.status) {
+        case "pending":
+          setStatus("等待扫码", "pending", true);
+          break;
+        case "scanned":
+          setStatus("已扫码，请在手机上确认", "scanned", true);
+          break;
+        case "authorized":
+        case "confirmed":
+          stopTimers();
+          setStatus("授权成功，正在入库…", "authorized", false);
+          // 去抖：延迟执行 confirm，让并发 poll 回调有机会被 stopTimers 拦截
+          settleTimer = setTimeout(async () => {
+            settleTimer = null;
+            await confirm();
+          }, 300);
+          break;
+        case "expired":
+        case "unknown":
+          stopTimers();
+          setStatus("二维码已失效，重新生成中…", "error", false);
+          setTimeout(newQR, 800);
+          break;
+        case "cancelled":
+          stopTimers();
+          $("countdown").textContent = "已取消";
+          setStatus("已取消，请重新生成", "error", false);
+          break;
+      }
+    }
+
+    async function confirm() {
+      // 防重入：若已有 confirm 正在执行（可能来自重复的 poll 回调），直接静默丢弃
+      if (confirming) return;
+      confirming = true;
+      $("refreshBtn").disabled = true;
+      try {
+        const acc = await api("POST", `/qr/${sid}/confirm`);
+        showSuccess(acc);
+      } catch (e) {
+        const msg = e.message || "未知错误";
+        if (e.status === 404 && msg.includes("not found")) {
+          setStatus("会话已失效，请重新扫码", "error", false);
+          $("countdown").textContent = "请点击「重新生成」";
+        } else if (e.status === 409) {
+          setStatus("入库失败：" + msg, "error", false);
+          $("countdown").textContent = "请稍后重试或重新扫码";
+        } else {
+          setStatus("入库失败：" + msg, "error", false);
+        }
+      } finally {
+        confirming = false;
+        $("refreshBtn").disabled = false;
+      }
+    }
+
+    $("refreshBtn").addEventListener("click", newQR);
+    newQR();
+  </script>
+</body>
+</html>

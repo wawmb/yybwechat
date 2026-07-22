@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# 运行时生成的数据（不打包进镜像）
+resource/db/*
+resource/avatars/*
+resource/qr/*
+
+# Docker 自身文件
+Dockerfile
+.dockerignore
+
+# 构建产物
+yybwechat
+*.exe
+
+# 临时文件
+*.tmp
+*.log
+tmp/
+data/
+.env
