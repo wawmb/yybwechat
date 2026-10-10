@@ -122,5 +122,113 @@ newQR();
 </script>
 </body></html>`
 
+// fallbackLoginHTML 是登录页的内嵌后备 HTML。
+const fallbackLoginHTML = `<!doctype html><html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<title>登录 · yybwechat</title>
+<style>
+:root{--bg:oklch(1 0 0);--bg2:oklch(0.974 0.004 250);--ink:oklch(0.19 0.025 252);--mu:oklch(0.43 0.025 252);--line:oklch(0.885 0.012 250);--pri:oklch(0.54 0.205 3);--err:oklch(0.55 0.18 25);--r:10px}
+[data-theme="dark"]{--bg:oklch(0.18 0.018 252);--bg2:oklch(0.15 0.014 252);--ink:oklch(0.94 0.008 250);--mu:oklch(0.68 0.018 252);--line:oklch(0.30 0.018 252)}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg2);color:var(--ink);font-family:system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;font-size:14px;padding:16px}
+.card{width:min(380px,100%);background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:28px}
+.logo{width:40px;height:40px;border-radius:var(--r);display:grid;place-items:center;background:var(--ink);color:var(--bg);font-weight:800;font-size:18px;margin-bottom:14px}
+h1{margin:0 0 6px;font-size:20px;font-weight:760}.sub{color:var(--mu);margin:0 0 22px;font-size:13px}
+label{display:block;font-size:12px;font-weight:640;margin:0 0 6px}
+input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r);background:var(--bg);color:var(--ink);font:inherit;margin-bottom:14px}
+input:focus{outline:2px solid var(--pri);outline-offset:-1px}
+.btn{width:100%;border:none;border-radius:var(--r);padding:11px;font:inherit;font-weight:700;cursor:pointer;background:var(--pri);color:#fff;transition:filter .16s}
+.btn:hover{filter:brightness(1.12)}.btn:disabled{opacity:.6;cursor:default}
+.err{color:var(--err);font-size:13px;min-height:20px;margin:0 0 10px}
+.foot{margin-top:16px;font-size:12px;color:var(--mu);text-align:center}
+</style>
+<body>
+<div class="card">
+<div class="logo">Y</div>
+<h1>管理员登录</h1>
+<p class="sub">登录后可使用控制台的全部功能</p>
+<form id="f">
+<label for="u">用户名</label><input id="u" name="username" autocomplete="username" required>
+<label for="p">密码</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+<p class="err" id="e"></p>
+<button class="btn" id="b" type="submit">登录</button>
+</form>
+<div class="foot" id="v"></div>
+</div>
+<script>
+(function(){var s=localStorage.getItem("yybwechat-theme");
+ if(s==="dark"||(!s&&matchMedia("(prefers-color-scheme:dark)").matches))document.documentElement.setAttribute("data-theme","dark");})();
+fetch("/api/auth/status").then(function(r){return r.json()}).then(function(d){
+ var v=(d.data||{}).version;if(v)document.getElementById("v").textContent="yybwechat v"+v;
+ if(!(d.data||{}).initialized)location.replace("/setup");
+}).catch(function(){});
+document.getElementById("f").addEventListener("submit",function(ev){
+ ev.preventDefault();var e=document.getElementById("e"),b=document.getElementById("b");
+ e.textContent="";b.disabled=true;b.textContent="登录中…";
+ fetch("/api/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({username:document.getElementById("u").value,password:document.getElementById("p").value})})
+ .then(function(r){return r.text().then(function(t){var j;try{j=JSON.parse(t)}catch(x){j={}};
+   if(r.ok&&j.code===0){location.replace("/");return}
+   e.textContent=(j&&j.msg)||("登录失败 HTTP "+r.status);b.disabled=false;b.textContent="登录";})})
+ .catch(function(x){e.textContent="网络错误: "+x.message;b.disabled=false;b.textContent="登录"});
+});
+</script>
+</body></html>`
+
+// fallbackSetupHTML 是首次启动的管理员初始化页内嵌后备 HTML。
+const fallbackSetupHTML = `<!doctype html><html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<title>初始化管理员 · yybwechat</title>
+<style>
+:root{--bg:oklch(1 0 0);--bg2:oklch(0.974 0.004 250);--ink:oklch(0.19 0.025 252);--mu:oklch(0.43 0.025 252);--line:oklch(0.885 0.012 250);--pri:oklch(0.54 0.205 3);--err:oklch(0.55 0.18 25);--ok:oklch(0.55 0.135 145);--r:10px}
+[data-theme="dark"]{--bg:oklch(0.18 0.018 252);--bg2:oklch(0.15 0.014 252);--ink:oklch(0.94 0.008 250);--mu:oklch(0.68 0.018 252);--line:oklch(0.30 0.018 252)}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg2);color:var(--ink);font-family:system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;font-size:14px;padding:16px}
+.card{width:min(380px,100%);background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:28px}
+.logo{width:40px;height:40px;border-radius:var(--r);display:grid;place-items:center;background:var(--ink);color:var(--bg);font-weight:800;font-size:18px;margin-bottom:14px}
+h1{margin:0 0 6px;font-size:20px;font-weight:760}.sub{color:var(--mu);margin:0 0 22px;font-size:13px;line-height:1.6}
+label{display:block;font-size:12px;font-weight:640;margin:0 0 6px}
+input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r);background:var(--bg);color:var(--ink);font:inherit;margin-bottom:14px}
+input:focus{outline:2px solid var(--pri);outline-offset:-1px}
+.btn{width:100%;border:none;border-radius:var(--r);padding:11px;font:inherit;font-weight:700;cursor:pointer;background:var(--pri);color:#fff;transition:filter .16s}
+.btn:hover{filter:brightness(1.12)}.btn:disabled{opacity:.6;cursor:default}
+.msg{font-size:13px;min-height:20px;margin:0 0 10px}.msg.err{color:var(--err)}.msg.ok{color:var(--ok)}
+.tip{margin-top:16px;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r);font-size:12px;color:var(--mu);line-height:1.6}
+</style>
+<body>
+<div class="card">
+<div class="logo">Y</div>
+<h1>创建管理员</h1>
+<p class="sub">这是首次启动，请设置管理员账号。系统只保留这一个账号，创建后不再显示本页。</p>
+<form id="f">
+<label for="u">用户名</label><input id="u" name="username" autocomplete="username" required>
+<label for="p">密码（至少 8 位）</label><input id="p" name="password" type="password" autocomplete="new-password" minlength="8" required>
+<label for="p2">确认密码</label><input id="p2" type="password" autocomplete="new-password" minlength="8" required>
+<p class="msg" id="e"></p>
+<button class="btn" id="b" type="submit">创建并登录</button>
+</form>
+<div class="tip">也可以在运行前通过 <code>YYB_ADMIN_USER</code> / <code>YYB_ADMIN_PASSWORD</code> 环境变量预设，适合容器化无人值守部署。</div>
+</div>
+<script>
+(function(){var s=localStorage.getItem("yybwechat-theme");
+ if(s==="dark"||(!s&&matchMedia("(prefers-color-scheme:dark)").matches))document.documentElement.setAttribute("data-theme","dark");})();
+fetch("/api/auth/status").then(function(r){return r.json()}).then(function(d){
+ if((d.data||{}).initialized)location.replace("/login");}).catch(function(){});
+document.getElementById("f").addEventListener("submit",function(ev){
+ ev.preventDefault();var e=document.getElementById("e"),b=document.getElementById("b");
+ var p=document.getElementById("p").value,p2=document.getElementById("p2").value;
+ if(p!==p2){e.className="msg err";e.textContent="两次输入的密码不一致";return}
+ if(p.length<8){e.className="msg err";e.textContent="密码至少需要 8 位";return}
+ e.textContent="";b.disabled=true;b.textContent="创建中…";
+ fetch("/api/auth/setup",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({username:document.getElementById("u").value,password:p})})
+ .then(function(r){return r.text().then(function(t){var j;try{j=JSON.parse(t)}catch(x){j={}};
+   if(r.ok&&j.code===0){e.className="msg ok";e.textContent="创建成功，正在进入控制台…";setTimeout(function(){location.replace("/")},600);return}
+   e.className="msg err";e.textContent=(j&&j.msg)||("创建失败 HTTP "+r.status);b.disabled=false;b.textContent="创建并登录";})})
+ .catch(function(x){e.className="msg err";e.textContent="网络错误: "+x.message;b.disabled=false;b.textContent="创建并登录"});
+});
+</script>
+</body></html>`
+
 // openAPISpec 是 OpenAPI 3.0 规范的运行时实例。
 var openAPISpec = newOpenAPISpec()

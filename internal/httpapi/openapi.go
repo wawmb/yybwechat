@@ -19,6 +19,8 @@ func newOpenAPISpec() map[string]any {
 			{"name": "accounts", "description": "已保存的微信账号"},
 			{"name": "wxapp", "description": "wxapp 业务接口调用"},
 			{"name": "settings", "description": "系统设置"},
+			{"name": "auth", "description": "管理员认证与会话"},
+			{"name": "system", "description": "服务元信息"},
 		},
 		"paths": map[string]any{
 			"/health": map[string]any{
@@ -81,7 +83,7 @@ func newOpenAPISpec() map[string]any {
 			"/accounts": map[string]any{
 				"get": openAPIOperation(
 					[]string{"accounts"},
-					"获取账号列表",
+					"获取账号列表（公开只读，免认证且无需令牌，供自动化脚本探测服务与挑选在线账号）。返回脱敏视图 AccountPublic，不含 login_buffer 与 credentials",
 					nil,
 					nil,
 					defaulted(map[string]any{
@@ -90,7 +92,7 @@ func newOpenAPISpec() map[string]any {
 				),
 				"delete": openAPIOperation(
 					[]string{"accounts"},
-					"删除账号",
+					"删除账号（需管理员登录：本接口虽与免认证的 GET 共用路径，但写操作只认管理员会话）",
 					[]map[string]any{queryStringParam("ref", "账号 ID、UIN 或 openid。", true)},
 					nil,
 					defaulted(map[string]any{
@@ -98,29 +100,29 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
-		"/accounts/refresh": map[string]any{
-			"post": openAPIOperation(
-				[]string{"accounts"},
-				"刷新单个或全部账号的存活状态 — 传 ref 刷新指定账号，不传则批量刷新全部。",
-				nil,
-				jsonOptionalRequestBody(refSchema("AccountRefRequest")),
-				defaulted(map[string]any{
-					"200": jsonResponse("传 ref 时返回单个 RefreshResult，不传时返回 RefreshResult 数组。", refSchema("RefreshResponse")),
-				}),
-			),
-		},
-		"/accounts/resync": map[string]any{
-			"post": openAPIOperation(
-				[]string{"accounts"},
-				"重新同步单个或全部账号资料 — 传 ref 同步指定账号，不传则批量同步全部。",
-				nil,
-				jsonOptionalRequestBody(refSchema("AccountRefRequest")),
-				defaulted(map[string]any{
-					"200": jsonResponse("传 ref 时返回单个 AccountPublic，不传时返回 AccountPublic 数组。", refSchema("ResyncResponse")),
-				}),
-			),
-		},
-		"/accounts/avatar": map[string]any{
+			"/accounts/refresh": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"刷新单个或全部账号的存活状态 — 传 ref 刷新指定账号，不传则批量刷新全部。",
+					nil,
+					jsonOptionalRequestBody(refSchema("AccountRefRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("传 ref 时返回单个 RefreshResult，不传时返回 RefreshResult 数组。", refSchema("RefreshResponse")),
+					}),
+				),
+			},
+			"/accounts/resync": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"重新同步单个或全部账号资料 — 传 ref 同步指定账号，不传则批量同步全部。",
+					nil,
+					jsonOptionalRequestBody(refSchema("AccountRefRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("传 ref 时返回单个 AccountPublic，不传时返回 AccountPublic 数组。", refSchema("ResyncResponse")),
+					}),
+				),
+			},
+			"/accounts/avatar": map[string]any{
 				"get": openAPIOperation(
 					[]string{"accounts"},
 					"获取账号头像",
@@ -196,6 +198,158 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			"/wxapp/getUserInfo": map[string]any{
+				"get": openAPIOperation(
+					[]string{"wxapp"},
+					"获取微信用户信息（走 HTTPS 通道，无需建立 MMTLS 会话）",
+					[]map[string]any{queryStringParam("ref", "账号 ID、UIN 或 openid。", true)},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("用户信息。", refSchema("WxappResponse")),
+					}),
+				),
+				"post": openAPIOperation(
+					[]string{"wxapp"},
+					"获取微信用户信息（POST 形式，ref 放请求体）",
+					nil,
+					jsonOptionalRequestBody(refSchema("AccountRefRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("用户信息。", refSchema("WxappResponse")),
+					}),
+				),
+			},
+			"/wxapp/oauth": map[string]any{
+				"post": openAPIOperation(
+					[]string{"wxapp"},
+					"构造公众号网页授权 URL — 只生成链接，code 需用户在微信内完成授权后由回调携带",
+					nil,
+					jsonRequestBody(refSchema("OAuthRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("授权链接。", refSchema("OAuthResponse")),
+					}),
+				),
+			},
+			"/accounts/remark": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"设置或清除账号备注（本地字段，不参与微信侧同步）",
+					nil,
+					jsonRequestBody(refSchema("AccountRemarkRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("更新后的账号。", refSchema("AccountPublic")),
+					}),
+				),
+			},
+			"/accounts/status": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"手动设置账号状态（alive 或 expired），用于修正自动检测的误判",
+					nil,
+					jsonRequestBody(refSchema("AccountStatusRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("更新后的账号。", refSchema("AccountPublic")),
+					}),
+				),
+			},
+			"/accounts/repair": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"清理扫码中断留下的残缺账号 — confirm=false 仅预览，confirm=true 才删除",
+					nil,
+					jsonRequestBody(refSchema("AccountConfirmRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("预览清单或清理结果。", freeFormObjectSchema("confirm=false 返回 candidates 与 count；confirm=true 返回 deleted。")),
+					}),
+				),
+			},
+			"/accounts/compact": map[string]any{
+				"post": openAPIOperation(
+					[]string{"accounts"},
+					"将账号 ID 重排为连续的 1..N — confirm=false 仅预览，confirm=true 才执行",
+					nil,
+					jsonRequestBody(refSchema("AccountConfirmRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("预览信息或重排映射。", freeFormObjectSchema("confirm=false 返回 current_ids 与 gaps；confirm=true 返回 changed 与 mapping。")),
+					}),
+				),
+			},
+			"/api/auth/status": map[string]any{
+				"get": openAPIOperation(
+					[]string{"auth"},
+					"查询管理员初始化状态与当前登录状态（公开接口）",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("认证状态。", refSchema("AuthStatusResponse")),
+					}),
+				),
+			},
+			"/api/auth/setup": map[string]any{
+				"post": openAPIOperation(
+					[]string{"auth"},
+					"首次启动创建管理员 — 系统只允许存在一个管理员，已存在时返回 409",
+					nil,
+					jsonRequestBody(refSchema("AuthCredentialRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("创建成功并自动登录。", refSchema("AuthLoginResponse")),
+					}),
+				),
+			},
+			"/api/auth/login": map[string]any{
+				"post": openAPIOperation(
+					[]string{"auth"},
+					"管理员登录，成功后下发会话 Cookie（同一 IP 连续失败 8 次将限流 15 分钟）",
+					nil,
+					jsonRequestBody(refSchema("AuthCredentialRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("登录成功。", refSchema("AuthLoginResponse")),
+					}),
+				),
+			},
+			"/api/auth/logout": map[string]any{
+				"post": openAPIOperation(
+					[]string{"auth"},
+					"注销当前会话并清除 Cookie",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("登出结果。", freeFormObjectSchema("ok 表示已登出。")),
+					}),
+				),
+			},
+			"/api/auth/me": map[string]any{
+				"get": openAPIOperation(
+					[]string{"auth"},
+					"查询当前登录管理员信息与版本（与 /api/auth/status 等价）",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("认证状态。", refSchema("AuthStatusResponse")),
+					}),
+				),
+			},
+			"/api/auth/password": map[string]any{
+				"put": openAPIOperation(
+					[]string{"auth"},
+					"修改管理员密码（需登录），成功后其它设备的会话会被下线",
+					nil,
+					jsonRequestBody(refSchema("AuthPasswordRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("修改结果。", freeFormObjectSchema("ok 表示已修改。")),
+					}),
+				),
+			},
+			"/api/version": map[string]any{
+				"get": openAPIOperation(
+					[]string{"system"},
+					"获取服务构建元数据（需登录）",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("版本信息。", refSchema("VersionResponse")),
+					}),
+				),
+			},
 		},
 		"components": map[string]any{
 			"schemas": map[string]any{
@@ -234,21 +388,27 @@ func newOpenAPISpec() map[string]any {
 					"avatar":          nullableStringSchema("本地头像路径或远程头像 URL。"),
 					"status":          nullableStringSchema("账号状态。"),
 					"device_id":       nullableStringSchema("稳定设备 MAC 标识，格式 02-XX-XX-XX-XX-XX。"),
+					"remark":          nullableStringSchema("账号备注，本地字段，不参与微信侧同步。"),
 					"last_checked_at": nullableInt64Schema(),
-					"created_at":      int64Schema(),
-					"updated_at":      int64Schema(),
+					"credential_expires_at": map[string]any{
+						"type":        "integer",
+						"format":      "int64",
+						"description": "凭据到期时间戳（Unix 秒）。0 表示无法判断。不含 token 本身，仅用于展示剩余有效期。",
+					},
+					"created_at": int64Schema(),
+					"updated_at": int64Schema(),
 				}),
-			"RefreshResult": objectSchema([]string{"id", "openid", "status"}, map[string]any{
-				"id":       int64Schema(),
-				"openid":   map[string]any{"type": "string"},
-				"uin":      nullableInt64Schema(),
-				"nickname": nullableStringSchema("账号昵称。"),
-				"status":   map[string]any{"type": "string", "enum": []string{"alive", "expired", "unknown"}, "description": "存活状态：alive=在线，expired=已过期，unknown=无法判定。"},
-			}),
-			"DeleteAccountResponse": objectSchema([]string{"deleted", "openid"}, map[string]any{
-				"deleted": map[string]any{"type": "integer", "format": "int64", "description": "被删除账号的 ID。"},
-				"openid":  map[string]any{"type": "string"},
-			}),
+				"RefreshResult": objectSchema([]string{"id", "openid", "status"}, map[string]any{
+					"id":       int64Schema(),
+					"openid":   map[string]any{"type": "string"},
+					"uin":      nullableInt64Schema(),
+					"nickname": nullableStringSchema("账号昵称。"),
+					"status":   map[string]any{"type": "string", "enum": []string{"alive", "expired", "unknown"}, "description": "存活状态：alive=在线，expired=已过期，unknown=无法判定。"},
+				}),
+				"DeleteAccountResponse": objectSchema([]string{"deleted", "openid"}, map[string]any{
+					"deleted": map[string]any{"type": "integer", "format": "int64", "description": "被删除账号的 ID。"},
+					"openid":  map[string]any{"type": "string"},
+				}),
 				"AccountRefRequest": objectSchema(nil, map[string]any{
 					"ref": map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。支持批量操作的接口不传时表示全部账号。"},
 				}),
@@ -276,12 +436,65 @@ func newOpenAPISpec() map[string]any {
 				"WebhookPutRequest": objectSchema([]string{"url"}, map[string]any{
 					"url": map[string]any{"type": "string", "description": "Webhook 回调地址，传空字符串则清空。"},
 				}),
-			"WebhookGetResponse": objectSchema([]string{"url"}, map[string]any{
-				"url": map[string]any{"type": "string", "description": "当前 Webhook 回调地址，未配置时为空字符串。"},
-			}),
+				"WebhookGetResponse": objectSchema([]string{"url"}, map[string]any{
+					"url": map[string]any{"type": "string", "description": "当前 Webhook 回调地址，未配置时为空字符串。"},
+				}),
 				"WebhookTestResponse": objectSchema([]string{"ok", "http_status"}, map[string]any{
-					"ok":         map[string]any{"type": "boolean", "description": "测试是否成功。"},
+					"ok":          map[string]any{"type": "boolean", "description": "测试是否成功。"},
 					"http_status": map[string]any{"type": "integer", "description": "目标服务器返回的 HTTP 状态码。"},
+				}),
+				"OAuthRequest": objectSchema([]string{"app_id", "redirect_uri"}, map[string]any{
+					"ref":             nullableStringSchema("可选，账号引用，仅做存在性校验。"),
+					"app_id":          map[string]any{"type": "string", "description": "公众号 AppID，18 位且以 wx 开头。"},
+					"redirect_uri":    map[string]any{"type": "string", "description": "授权回调地址，必须是绝对 http/https URL。"},
+					"scope":           nullableStringSchema("snsapi_base（静默）或 snsapi_userinfo（弹窗），默认 snsapi_base。"),
+					"state":           nullableStringSchema("可选回传状态，留空自动生成随机值。"),
+					"component_appid": nullableStringSchema("可选，第三方平台 AppID。"),
+				}),
+				"OAuthResponse": objectSchema([]string{"url", "full_url"}, map[string]any{
+					"url":       map[string]any{"type": "string", "description": "授权链接。"},
+					"full_url":  map[string]any{"type": "string", "description": "追加 #wechat_redirect 后的完整链接。"},
+					"scope":     map[string]any{"type": "string"},
+					"state":     map[string]any{"type": "string"},
+					"authorize": map[string]any{"type": "string", "description": "授权方式说明。"},
+				}),
+				"AccountRemarkRequest": objectSchema([]string{"ref"}, map[string]any{
+					"ref":    map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},
+					"remark": nullableStringSchema("备注内容，留空表示清除，最多 128 字符。"),
+				}),
+				"AccountStatusRequest": objectSchema([]string{"ref", "status"}, map[string]any{
+					"ref":    map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},
+					"status": map[string]any{"type": "string", "description": "目标状态，仅接受 alive 或 expired。"},
+				}),
+				"AccountConfirmRequest": objectSchema(nil, map[string]any{
+					"confirm": map[string]any{"type": "boolean", "description": "false 仅预览影响范围，true 才真正执行。"},
+				}),
+				"AuthCredentialRequest": objectSchema([]string{"username", "password"}, map[string]any{
+					"username": map[string]any{"type": "string", "description": "管理员用户名。"},
+					"password": map[string]any{"type": "string", "description": "密码，初始化与修改时至少 8 位。"},
+				}),
+				"AuthPasswordRequest": objectSchema([]string{"old_password", "new_password"}, map[string]any{
+					"old_password": map[string]any{"type": "string", "description": "当前密码。"},
+					"new_password": map[string]any{"type": "string", "description": "新密码，至少 8 位。"},
+				}),
+				"AuthStatusResponse": objectSchema(nil, map[string]any{
+					"enabled":       map[string]any{"type": "boolean", "description": "是否启用认证。"},
+					"initialized":   map[string]any{"type": "boolean", "description": "是否已创建管理员。"},
+					"authenticated": map[string]any{"type": "boolean", "description": "当前请求是否已登录。"},
+					"username":      nullableStringSchema("当前登录管理员用户名。"),
+					"version":       nullableStringSchema("服务版本号。"),
+					"commit":        nullableStringSchema("构建提交号。"),
+					"build_date":    nullableStringSchema("构建时间。"),
+				}),
+				"AuthLoginResponse": objectSchema([]string{"authenticated"}, map[string]any{
+					"authenticated": map[string]any{"type": "boolean", "description": "是否已建立会话。"},
+					"username":      map[string]any{"type": "string"},
+					"expires_in":    map[string]any{"type": "integer", "description": "会话有效期（秒）。"},
+				}),
+				"VersionResponse": objectSchema(nil, map[string]any{
+					"version":    map[string]any{"type": "string", "description": "语义化版本号。"},
+					"commit":     map[string]any{"type": "string", "description": "构建提交号（短哈希）。"},
+					"build_date": map[string]any{"type": "string", "description": "构建时间。"},
 				}),
 			},
 		},

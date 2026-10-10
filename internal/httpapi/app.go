@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -21,9 +22,11 @@ import (
 	"github.com/gin-gonic/gin"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
 
+	"yybwechat/internal/auth"
 	"yybwechat/internal/protocol"
 	"yybwechat/internal/qr"
 	"yybwechat/internal/store"
+	"yybwechat/internal/version"
 )
 
 // Config 是 App 的配置参数，由 main 函数传入。
@@ -38,23 +41,45 @@ type Config struct {
 	QRSessionTTL   time.Duration // 二维码会话过期时间
 	CheckInterval  time.Duration // 后台健康检查间隔（0 禁用）
 	CheckStale     time.Duration // 超过此时间未检查视为过期，触发刷新
+
+	// ---- 管理员认证 ----
+	AuthDBFilename  string        // 认证数据库文件名（位于 data-root/db 下）
+	SessionDuration time.Duration // 管理会话有效期，默认 7 天
+	CookieSecure    bool          // 是否为会话 Cookie 加 Secure（HTTPS 部署时开启）
+	AdminUser       string        // 预设管理员用户名（可选，留空则走 /setup 初始化）
+	AdminPassword   string        // 预设管理员口令（可选，需与 AdminUser 同时提供）
+
+	// ---- 协议接口保护 ----
+	ProtocolToken string // /wxapp/* 的 Bearer 令牌，留空表示不校验
+
+	// ---- 凭据保活 ----
+	KeepAliveInterval time.Duration // 保活扫描间隔（0 禁用）
+	KeepAliveAhead    time.Duration // 凭据剩余有效期低于此值时提前刷新
 }
 
 // App 是服务的核心实例，聚合了 HTTP 路由、数据库、协议连接池和二维码客户端。
 type App struct {
 	cfg       Config
-	resources resources        // 运行时资源目录
-	db        *store.DB        // SQLite 数据库实例
-	pool      *protocol.Pool   // MMTLS 协议连接池
-	qr        *qr.Client       // 微信二维码登录客户端
+	resources resources      // 运行时资源目录
+	db        *store.DB      // SQLite 数据库实例
+	pool      *protocol.Pool // MMTLS 协议连接池
+	qr        *qr.Client     // 微信二维码登录客户端
+	auth      *auth.Store    // 管理员认证库（独立 auth.db）
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session // 活跃的二维码会话
 
-	webhookURL   string          // 当前 Webhook 地址（由 /settings/webhook API 动态读写）
-	webhookMu    sync.RWMutex    // 保护 webhookURL 的并发读写
-	stopHealth   chan struct{}   // 通知后台健康检查 goroutine 退出
-	healthClient *http.Client    // Webhook 推送专用的 HTTP 客户端
+	loginLimit loginLimiter // 登录失败限流表
+
+	webhookURL   string        // 当前 Webhook 地址（由 /settings/webhook API 动态读写）
+	webhookMu    sync.RWMutex  // 保护 webhookURL 的并发读写
+	stopHealth   chan struct{} // 通知后台健康检查 goroutine 退出
+	stopKeep     chan struct{} // 通知后台保活 goroutine 退出
+	healthClient *http.Client  // Webhook 推送专用的 HTTP 客户端
+
+	keepAliveMu    sync.Mutex          // 保护保活重退避状态表
+	keepAliveNext  map[int64]time.Time // 账号 ID → 下次可重试时间（失败退避）
+	keepAliveFails map[int64]int       // 账号 ID → 连续失败次数（用于递增退避）
 }
 
 // swaggerDocsHandler 是 Swagger UI 的 HTTP 处理器。
@@ -92,6 +117,12 @@ func NewApp(cfg Config) (*App, error) {
 	if cfg.CheckStale == 0 {
 		cfg.CheckStale = 3600 * time.Second
 	}
+	if cfg.SessionDuration == 0 {
+		cfg.SessionDuration = 7 * 24 * time.Hour
+	}
+	if cfg.KeepAliveAhead == 0 {
+		cfg.KeepAliveAhead = 45 * time.Minute
+	}
 	res, err := ensureResources(cfg.ResourceRoot, cfg.DataRoot)
 	if err != nil {
 		return nil, err
@@ -119,6 +150,28 @@ func NewApp(cfg Config) (*App, error) {
 		healthClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		keepAliveNext:  map[int64]time.Time{},
+		keepAliveFails: map[int64]int{},
+	}
+
+	// 打开独立的认证数据库。与主库分离，避免影响业务表结构。
+	authPath := auth.AuthDBPath(res.DB, cfg.AuthDBFilename)
+	authStore, err := auth.Open(authPath)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("打开认证数据库失败: %w", err)
+	}
+	app.auth = authStore
+
+	// 支持通过环境变量预设管理员，便于容器化无人值守部署
+	if cfg.AdminUser != "" && cfg.AdminPassword != "" {
+		if has, _ := authStore.HasAdmin(context.Background()); !has {
+			if _, err := authStore.CreateAdmin(context.Background(), cfg.AdminUser, cfg.AdminPassword); err != nil {
+				log.Printf("[auth] 预设管理员创建失败: %v", err)
+			} else {
+				log.Printf("[auth] 已根据环境变量预设管理员: %s", cfg.AdminUser)
+			}
+		}
 	}
 
 	// 从数据库加载 webhook URL
@@ -134,22 +187,50 @@ func NewApp(cfg Config) (*App, error) {
 		log.Printf("[health] 后台健康检查已启动，间隔=%s，过期阈值=%s", cfg.CheckInterval, cfg.CheckStale)
 	}
 
+	// 启动凭据保活（若 KeepAliveInterval > 0）
+	if cfg.KeepAliveInterval > 0 {
+		app.stopKeep = make(chan struct{})
+		go app.runKeepAlive()
+		log.Printf("[keepalive] 凭据保活已启动，间隔=%s，提前量=%s", cfg.KeepAliveInterval, cfg.KeepAliveAhead)
+	}
+
+	// 未初始化管理员时输出提示，引导访问 /setup
+	if has, _ := authStore.HasAdmin(context.Background()); !has {
+		log.Printf("[auth] %s", auth.FormatSetupHint(authPath))
+	}
+
 	return app, nil
 }
 
-// Close 关闭 App，释放数据库连接等资源。
+// Close 关闭 App，停止后台 goroutine 并释放数据库连接等资源。
 func (a *App) Close() error {
 	if a.stopHealth != nil {
 		close(a.stopHealth)
 	}
-	if a.db != nil {
-		return a.db.Close()
+	if a.stopKeep != nil {
+		close(a.stopKeep)
 	}
-	return nil
+	var err error
+	if a.db != nil {
+		err = a.db.Close()
+	}
+	if a.auth != nil {
+		if aerr := a.auth.Close(); err == nil {
+			err = aerr
+		}
+	}
+	return err
 }
 
 // Handler 创建并返回配置好所有路由的 http.Handler。
-// 包含首页、扫码页、API 文档、账号管理、wxapp 接口代理等路由。
+//
+// 路由按安全边界划分为三组：
+//  1. 公开组：健康检查、静态资源、登录/初始化与认证接口、OpenAPI 文档；
+//  2. 协议组：/wxapp/*，供自动化脚本调用，不以浏览器会话鉴权，
+//     可选通过 ProtocolToken 做 Bearer 门禁；
+//  3. 管理组：首页、扫码、账号管理、设置等，全部要求管理员登录。
+//
+// 使用 gin.Group 划分而非顺序 Use，避免中间件泄漏到后续分组。
 func (a *App) Handler() http.Handler {
 	if os.Getenv(gin.EnvGinMode) == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -158,33 +239,108 @@ func (a *App) Handler() http.Handler {
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
 
-	router.Any("/", gin.WrapF(a.handleIndex))
-	router.Any("/scan", gin.WrapF(a.handleScan))
-	router.Any("/docs", func(c *gin.Context) {
-		c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
-	})
-	router.Any("/docs/*path", gin.WrapF(a.handleDocs))
-	router.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
-	router.Any("/health", func(c *gin.Context) {
+	// ---- 1. 公开组 ----
+	open := router.Group("/")
+	open.Any("/health", func(c *gin.Context) {
 		writeJSON(c.Writer, http.StatusOK, gin.H{"ok": true})
 	})
-	router.StaticFS("/static", http.Dir(a.resources.Static))
-	router.Any("/qr", gin.WrapF(a.handleQRRoot))
-	router.Any("/qr/*path", gin.WrapF(a.handleQR))
-	router.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
-	router.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
-	router.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
-	router.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
-	router.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
-	router.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
-	router.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
-	router.Any("/settings/webhook", gin.WrapF(a.handleSettingsWebhook))
-	router.Any("/settings/webhook/test", gin.WrapF(a.handleWebhookTest))
+	open.StaticFS("/static", http.Dir(a.resources.Static))
+	open.Any("/login", gin.WrapF(a.handleLogin))
+	open.Any("/setup", gin.WrapF(a.handleSetup))
+	open.Any("/api/auth/status", gin.WrapF(a.handleAuthStatus))
+	open.Any("/api/auth/setup", gin.WrapF(a.handleAuthSetup))
+	open.Any("/api/auth/login", gin.WrapF(a.handleAuthLogin))
+	open.Any("/api/auth/logout", gin.WrapF(a.handleAuthLogout))
+	open.Any("/api/auth/me", gin.WrapF(a.handleAuthMe))
+	open.Any("/api/auth/password", gin.WrapF(a.handleAuthPassword))
+	open.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
+	// GET /accounts 免认证且不需要任何令牌：自动化脚本（青龙面板定时任务等）
+	// 第一步就是用它探测服务并拉取账号列表，要求脚本先做交互式登录或配置静态令牌
+	// 都会直接打断无人值守的调用链。
+	// 放开的只是只读：返回 AccountPublic，剔除了 login_buffer 与 credentials。
+	// DELETE 等写操作在 handleAccountsRoot 内部二次鉴权，仍然要求管理员登录。
+	open.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
+
+	// ---- 2. 协议组（可选令牌门禁）----
+	// 统一使用 /wxapp/* 命名空间，不另开平行的兼容别名路径。
+	proto := router.Group("/", a.protocolTokenGate())
+	proto.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
+	proto.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
+	proto.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
+	proto.Any("/wxapp/getUserInfo", gin.WrapF(a.handleGetUserInfo))
+	proto.Any("/wxapp/oauth", gin.WrapF(a.handleOAuth))
+
+	// ---- 3. 管理组（需登录）----
+	secure := router.Group("/", a.requireBrowserSession())
+	secure.Any("/", gin.WrapF(a.handleIndex))
+	secure.Any("/scan", gin.WrapF(a.handleScan))
+	secure.Any("/docs", func(c *gin.Context) {
+		c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
+	})
+	secure.Any("/docs/*path", gin.WrapF(a.handleDocs))
+	secure.Any("/qr", gin.WrapF(a.handleQRRoot))
+	secure.Any("/qr/*path", gin.WrapF(a.handleQR))
+	secure.Any("/accounts/avatar", gin.WrapF(a.handleAccountAvatar))
+	secure.Any("/accounts/refresh", gin.WrapF(a.handleAccountRefresh))
+	secure.Any("/accounts/resync", gin.WrapF(a.handleAccountResync))
+	secure.Any("/accounts/remark", gin.WrapF(a.handleAccountRemark))
+	secure.Any("/accounts/repair", gin.WrapF(a.handleAccountRepair))
+	secure.Any("/accounts/compact", gin.WrapF(a.handleAccountCompact))
+	secure.Any("/accounts/status", gin.WrapF(a.handleAccountStatus))
+	secure.Any("/settings/webhook", gin.WrapF(a.handleSettingsWebhook))
+	secure.Any("/settings/webhook/test", gin.WrapF(a.handleWebhookTest))
+	secure.Any("/api/version", gin.WrapF(a.handleVersion))
+
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c.Writer, http.StatusNotFound, "not found")
 	})
 
 	return router
+}
+
+// protocolTokenGate 是协议接口的可选 Bearer 令牌门禁。
+// 未配置 ProtocolToken 时直接放行（保持内网自托管的易用性）；
+// 配置后要求请求携带 Authorization: Bearer <token>，使用常量时间比较防时序攻击。
+func (a *App) protocolTokenGate() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if a.cfg.ProtocolToken == "" {
+			c.Next()
+			return
+		}
+		token := bearerToken(c.Request)
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.ProtocolToken)) != 1 {
+			writeError(c.Writer, http.StatusUnauthorized, "invalid or missing protocol token")
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// bearerToken 从 Authorization 头或 query 参数中提取 Bearer 令牌。
+func bearerToken(r *http.Request) string {
+	v := r.Header.Get("Authorization")
+	if v == "" {
+		v = r.URL.Query().Get("access_token")
+	}
+	if !strings.HasPrefix(strings.ToLower(v), "bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(v[len("bearer "):])
+}
+
+// handleVersion 返回服务构建元数据，供控制台顶栏展示。
+func (a *App) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ver, commit, buildDate := version.Info()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version":    ver,
+		"commit":     commit,
+		"build_date": buildDate,
+	})
 }
 
 // handleIndex 处理首页请求，返回 HTML 控制台页面。
@@ -265,7 +421,7 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 		"image_url":  "/qr/" + img.Session.ID + "/image",
 	}
 	if r.URL.Query().Get("as_base64") == "true" {
-		out["image_base64"] = qr.DataURIJPEG(img.ImageBytes)
+		out["image_base64"] = qr.DataURIImage(img.ImageBytes)
 	} else {
 		out["image_base64"] = nil
 	}
@@ -327,7 +483,8 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "qr session not found")
 			return
 		}
-		result, err := a.qr.GetLoginBuffer(r.Context(), sess)
+		// 微信授权已完成但 login buffer 可能尚未就绪，短窗口内重试吸收这段竞态
+		result, err := getLoginBufferWithRetry(r.Context(), a.qr, sess)
 		if err != nil {
 			writeError(w, http.StatusConflict, "buffer not ready: "+err.Error())
 			return
@@ -350,6 +507,11 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 
 // handleAccountsRoot 处理 /accounts 的 GET 和 DELETE 请求。
 // GET 返回所有已保存账号的列表，DELETE 删除指定账号。
+//
+// GET 走的是公开路由（免认证、无令牌），因为自动化脚本的调用链第一步就是它。
+// 这里只放行只读：返回 AccountPublic（剔除 login_buffer 与 credentials），
+// DELETE 与其它方法一律要求通过 a.isAuthenticated 走管理员会话鉴权，
+// 避免「为了让脚本能读列表」而把删除账号的能力也一起放开。
 func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/accounts" {
 		writeError(w, http.StatusNotFound, "not found")
@@ -368,6 +530,10 @@ func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodDelete:
+		if !a.isAuthenticated(r) {
+			writeError(w, http.StatusUnauthorized, "删除账号需要先登录")
+			return
+		}
 		acc, ok := a.resolveAccountFromQuery(w, r)
 		if !ok {
 			return
@@ -378,6 +544,10 @@ func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": acc.ID, "openid": acc.OpenID})
 	default:
+		if !a.isAuthenticated(r) {
+			writeError(w, http.StatusUnauthorized, "请先登录")
+			return
+		}
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
@@ -422,7 +592,7 @@ func (a *App) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, _ := a.refreshLiveness(r.Context(), acc)
+	status, _, _ := a.refreshLiveness(r.Context(), acc)
 	writeJSON(w, http.StatusOK, refreshOut(acc, status))
 }
 
@@ -708,7 +878,7 @@ func (a *App) refreshAll(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(accounts))
 	for _, acc := range accounts {
-		status, _ := a.refreshLiveness(context.Background(), acc)
+		status, _, _ := a.refreshLiveness(context.Background(), acc)
 		out = append(out, refreshOut(acc, status))
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -759,25 +929,43 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 }
 
 // refreshLiveness 刷新单个账号的存活状态。
-// 返回 status ("alive"、"expired" 或 "unknown") 和新的 LoginBuffer
-// (仅 status=="alive" 时非空)。
-func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) (status string, newLoginBuffer string) {
+//
+// 返回 status ("alive"、"expired" 或 "unknown")、新的 LoginBuffer
+// (仅 status=="alive" 时非空)，以及刷新过程中的错误。
+//
+// 状态判定规则（与 definitiveCredentialFailure 配合）：
+//   - "alive"   ：刷新成功；
+//   - "expired" ：刷新失败，且错误明确表明凭据已彻底失效，必须重新扫码；
+//   - "unknown" ：刷新失败但属于网络抖动、超时等瞬时错误。此时保留原状态与 MMTLS
+//     会话等待下一轮重试，避免把一次抖动误判成掉线并推送告警。
+//
+// 注意：只有 "expired" 会清理 MMTLS 会话；"unknown" 不清理，因为旧会话可能仍然可用。
+func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) (status string, newLoginBuffer string, err error) {
 	if acc.Credentials == nil {
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
-		return "unknown", ""
+		return "unknown", "", errors.New("account has no credentials")
 	}
 	creds := protocol.CredentialsFromMap(acc.Credentials)
-	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
-	if err != nil {
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return "expired", ""
+	result, refreshErr := a.qr.RefreshLoginBuffer(ctx, creds)
+	if refreshErr != nil {
+		if definitiveCredentialFailure(refreshErr) {
+			_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
+			// 凭据已彻底失效，清理会话，避免后续请求继续复用过期会话
+			a.invalidateAccountSessions(ctx, acc.ID)
+			return "expired", "", refreshErr
+		}
+		// 瞬时错误：不改写为 expired，也不清理会话，等待下一轮重试自然恢复
+		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
+		return "unknown", "", refreshErr
 	}
 	_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
+	// 凭据已更新，旧 MMTLS 会话不再有效，必须清理以触发重新登录
+	a.invalidateAccountSessions(ctx, acc.ID)
 	_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
 	if avatar := a.resolveAvatar(ctx, acc.OpenID, acc.UserInfo); avatar != "" {
 		_ = a.db.SetAccountProfile(ctx, acc.ID, acc.Nickname, &avatar, acc.UserInfo)
 	}
-	return "alive", result.LoginBuffer
+	return "alive", result.LoginBuffer, nil
 }
 
 // resyncProfile 重新同步账号的个人资料信息。
@@ -811,7 +999,7 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 		}
 		_ = a.db.InvalidateSession(ctx, acc.ID, proxy)
 	}
-	status, newBuffer := a.refreshLiveness(ctx, acc)
+	status, newBuffer, _ := a.refreshLiveness(ctx, acc)
 	if status != "alive" {
 		return nil, accountExpiredError{openid: acc.OpenID}
 	}
@@ -946,8 +1134,13 @@ func (a *App) scanAndCheck() {
 		default:
 		}
 
-		// 跳过无需检查的账号：无凭证或 last_checked_at 仍在有效期内
+		// 跳过无需检查的账号：无凭证、已判定失效、或 last_checked_at 仍在有效期内
 		if acc.Credentials == nil {
+			continue
+		}
+		// 与凭据保活保持一致：一旦判定为 expired，凭据已彻底失效，只能靠用户重新扫码。
+		// 这里如果不跳过，健康检查会在 stale 窗口过期后反复尝试刷新一个救不回来的账号。
+		if deref(acc.Status) == "expired" {
 			continue
 		}
 		lastChecked := int64(0)
@@ -959,9 +1152,14 @@ func (a *App) scanAndCheck() {
 		}
 
 		oldStatus := deref(acc.Status)
-		newStatus, _ := a.refreshLiveness(context.Background(), acc)
+		newStatus, _, refreshErr := a.refreshLiveness(context.Background(), acc)
 
-		if oldStatus != "" && oldStatus != newStatus {
+		if refreshErr != nil {
+			// 瞬时错误会归为 unknown 并等待重试，这里只记录原因，不推送告警
+			log.Printf("[health] 账号 %s (%s) 刷新失败: %v",
+				deref(acc.Nickname), acc.OpenID, refreshErr)
+		}
+		if shouldNotifyStatusChange(oldStatus, newStatus) {
 			log.Printf("[health] 账号 %s (%s) 状态变更: %s → %s",
 				deref(acc.Nickname), acc.OpenID, oldStatus, newStatus)
 			a.notifyWebhook(acc, oldStatus, newStatus)
@@ -974,6 +1172,17 @@ func (a *App) scanAndCheck() {
 	} else if n > 0 {
 		log.Printf("[health] 已清理 %d 条过期会话", n)
 	}
+}
+
+// shouldNotifyStatusChange 判断一次状态变化是否值得推送 Webhook。
+//
+// 只有收敛到终态（alive 可用 / expired 需重扫）才通知。unknown 表示本轮无法判定
+// （网络抖动、超时等），下一轮重试即可恢复，推送只会制造告警噪音。
+func shouldNotifyStatusChange(oldStatus, newStatus string) bool {
+	if oldStatus == "" || oldStatus == newStatus {
+		return false
+	}
+	return newStatus == "alive" || newStatus == "expired"
 }
 
 // notifyWebhook 向已配置的 Webhook 地址 POST 账号状态变更通知。
@@ -1227,6 +1436,9 @@ func toFloat64(v any) (float64, bool) {
 	}
 	return 0, false
 }
+
+// itoa 把 int64 格式化为十进制字符串，用于构造 JSON 对象键。
+func itoa(v int64) string { return strconv.FormatInt(v, 10) }
 
 // stringPtrMaybe 将空字符串转为 nil 指针，非空字符串转为指针。
 func stringPtrMaybe(s string) *string {

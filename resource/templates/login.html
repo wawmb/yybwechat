@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="stylesheet" href="/static/css/console.css">
+  <title>登录 · yybwechat</title>
+  <style>
+    /* 页面专属：居中卡片与表单节奏，通用样式见 console.css */
+    body { min-height: 100vh; display: grid; place-items: center; padding: 20px; line-height: 1.6; }
+
+    .card {
+      width: min(380px, 100%);
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--radius-lg); padding: 28px; box-shadow: var(--shadow-md);
+    }
+    .brand { gap: 10px; margin-bottom: 18px; }
+
+    h1 { margin: 0 0 6px; font-size: 20px; font-weight: 760; letter-spacing: -0.01em; }
+    .sub { margin: 0 0 22px; color: var(--muted); font-size: 13px; }
+    .form-grid { display: grid; gap: 14px; margin-bottom: 16px; }
+    .err { min-height: 20px; margin: 0 0 10px; font-size: 13px; color: var(--danger); }
+    .foot { margin-top: 16px; text-align: center; font-size: 12px; color: var(--faint); }
+    .theme-btn { position: fixed; top: 16px; right: 16px; }
+  </style>
+</head>
+<body>
+  <button class="theme-btn" id="themeToggle" title="切换主题" aria-label="切换深色/浅色模式">🌓</button>
+  <div class="card">
+    <div class="brand">
+      <div class="mark" aria-hidden="true">Y</div>
+      <div>
+        <div class="brand-title">yybwechat</div>
+        <div class="brand-sub">微信扫码登录服务</div>
+      </div>
+    </div>
+    <h1>管理员登录</h1>
+    <p class="sub">登录后可使用控制台的全部功能</p>
+    <form id="loginForm" autocomplete="on">
+      <div class="form-grid">
+        <div class="field">
+          <label for="username">用户名</label>
+          <input class="input" id="username" name="username" autocomplete="username" required spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+      </div>
+      <p class="err" id="err" role="alert"></p>
+      <button class="btn primary btn-block" id="submitBtn" type="submit">登录</button>
+    </form>
+    <div class="foot" id="version"></div>
+  </div>
+  <script>
+    (function () {
+      var saved = localStorage.getItem("yybwechat-theme");
+      if (saved === "dark" || (!saved && matchMedia("(prefers-color-scheme: dark)").matches)) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+    document.getElementById("themeToggle").addEventListener("click", function () {
+      var dark = document.documentElement.getAttribute("data-theme") === "dark";
+      if (dark) { document.documentElement.removeAttribute("data-theme"); localStorage.setItem("yybwechat-theme", "light"); }
+      else { document.documentElement.setAttribute("data-theme", "dark"); localStorage.setItem("yybwechat-theme", "dark"); }
+    });
+
+    // 尚未初始化管理员时引导到初始化页
+    fetch("/api/auth/status").then(function (r) { return r.json(); }).then(function (j) {
+      var d = j.data || {};
+      if (d.version) document.getElementById("version").textContent = "yybwechat v" + d.version;
+      if (!d.initialized) location.replace("/setup");
+    }).catch(function () {});
+
+    document.getElementById("loginForm").addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var err = document.getElementById("err"), btn = document.getElementById("submitBtn");
+      err.textContent = ""; btn.disabled = true; btn.textContent = "登录中…";
+      fetch("/api/auth/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("username").value,
+          password: document.getElementById("password").value
+        })
+      }).then(function (r) {
+        return r.text().then(function (t) {
+          var j = {}; try { j = JSON.parse(t); } catch (e) { j = {}; }
+          if (r.ok && j.code === 0) { location.replace("/"); return; }
+          err.textContent = j.msg || ("登录失败 HTTP " + r.status);
+          btn.disabled = false; btn.textContent = "登录";
+        });
+      }).catch(function (e) {
+        err.textContent = "网络错误: " + e.message;
+        btn.disabled = false; btn.textContent = "登录";
+      });
+    });
+  </script>
+</body>
+</html>

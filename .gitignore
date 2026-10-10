@@ -12,6 +12,31 @@ Thumbs.db
 # 环境变量
 .env
 
+# 运行时数据（含敏感信息，绝不可提交）
+# data/db/yyb.db   — 账号凭据 access_token / refresh_token / login_buffer
+# data/db/auth.db  — 管理员 bcrypt 口令哈希与会话令牌摘要
+data/
+resource/db/*
+resource/avatars/*
+resource/qr/*
+!resource/db/.gitkeep
+!resource/avatars/.gitkeep
+!resource/qr/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+
+# 构建产物
+/yybwechat
+/yybwechat.exe
+*.exe
+/out/
+dist/
+
+# 测试覆盖率
+*.out
+coverage.txt
+
 # 临时文件
 tmp/
 *.tmp

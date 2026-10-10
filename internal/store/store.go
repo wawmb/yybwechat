@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS wechat_accounts (
     credentials     TEXT,
     status          TEXT,
     device_id       TEXT,
+    remark          TEXT,
     last_checked_at INTEGER,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
@@ -76,24 +77,52 @@ type WechatAccount struct {
 	Credentials   map[string]any `json:"credentials,omitempty"`
 	Status        *string        `json:"status,omitempty"`
 	DeviceID      *string        `json:"device_id,omitempty"`
+	Remark        *string        `json:"remark,omitempty"`
 	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
 	CreatedAt     int64          `json:"created_at"`
 	UpdatedAt     int64          `json:"updated_at"`
 }
 
 // AccountPublic 是 WechatAccount 的安全公开视图，隐藏了 login_buffer 和 credentials 等敏感字段。
+//
+// credential_expires_at 只暴露凭据的到期时间戳，不暴露 token 本身，
+// 用于在控制台展示「凭据剩余有效期」，让后台凭据保活的效果对用户可见。
 type AccountPublic struct {
-	ID            int64   `json:"id"`
-	OpenID        string  `json:"openid"`
-	UIN           *int64  `json:"uin"`
-	Alias         *string `json:"alias"`
-	Nickname      *string `json:"nickname"`
-	Avatar        *string `json:"avatar"`
-	Status        *string `json:"status"`
-	DeviceID      *string `json:"device_id"`
-	LastCheckedAt *int64  `json:"last_checked_at"`
-	CreatedAt     int64   `json:"created_at"`
-	UpdatedAt     int64   `json:"updated_at"`
+	ID                  int64   `json:"id"`
+	OpenID              string  `json:"openid"`
+	UIN                 *int64  `json:"uin"`
+	Alias               *string `json:"alias"`
+	Nickname            *string `json:"nickname"`
+	Avatar              *string `json:"avatar"`
+	Status              *string `json:"status"`
+	DeviceID            *string `json:"device_id"`
+	Remark              *string `json:"remark"`
+	LastCheckedAt       *int64  `json:"last_checked_at"`
+	CredentialExpiresAt int64   `json:"credential_expires_at"`
+	CreatedAt           int64   `json:"created_at"`
+	UpdatedAt           int64   `json:"updated_at"`
+}
+
+// credentialExpiresAt 从凭据映射中读取到期时间戳，无法判断时返回 0。
+//
+// 这里刻意不引用 protocol 包：store 只需要一个数字，避免为取一个字段而引入协议层依赖。
+func credentialExpiresAt(credentials map[string]any) int64 {
+	if credentials == nil {
+		return 0
+	}
+	switch v := credentials["expires_at"].(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	default:
+		return 0
+	}
 }
 
 // SessionRow 表示 sessions 表中的一行，存储已建立的 MMTLS 会话。
@@ -147,6 +176,10 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateSettingsTable(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateAddRemark(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -429,21 +462,23 @@ func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 
 func (a *WechatAccount) Public() AccountPublic {
 	return AccountPublic{
-		ID:            a.ID,
-		OpenID:        a.OpenID,
-		UIN:           a.UIN,
-		Alias:         a.Alias,
-		Nickname:      a.Nickname,
-		Avatar:        a.Avatar,
-		Status:        a.Status,
-		DeviceID:      a.DeviceID,
-		LastCheckedAt: a.LastCheckedAt,
-		CreatedAt:     a.CreatedAt,
-		UpdatedAt:     a.UpdatedAt,
+		ID:                  a.ID,
+		OpenID:              a.OpenID,
+		UIN:                 a.UIN,
+		Alias:               a.Alias,
+		Nickname:            a.Nickname,
+		Avatar:              a.Avatar,
+		Status:              a.Status,
+		DeviceID:            a.DeviceID,
+		Remark:              a.Remark,
+		LastCheckedAt:       a.LastCheckedAt,
+		CredentialExpiresAt: credentialExpiresAt(a.Credentials),
+		CreatedAt:           a.CreatedAt,
+		UpdatedAt:           a.UpdatedAt,
 	}
 }
 
-const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, device_id, last_checked_at, created_at, updated_at FROM wechat_accounts`
+const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, device_id, remark, last_checked_at, created_at, updated_at FROM wechat_accounts`
 
 type accountScanner interface {
 	Scan(dest ...any) error
@@ -455,15 +490,15 @@ func (db *DB) scanAccount(row accountScanner) (*WechatAccount, error) {
 
 func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	var (
-		a                       WechatAccount
-		uin, lastChecked        sql.NullInt64
-		alias, nickname, avatar sql.NullString
-		userJSON, credJSON      sql.NullString
-		status, deviceID        sql.NullString
+		a                        WechatAccount
+		uin, lastChecked         sql.NullInt64
+		alias, nickname, avatar  sql.NullString
+		userJSON, credJSON       sql.NullString
+		status, deviceID, remark sql.NullString
 	)
 	err := row.Scan(
 		&a.ID, &a.OpenID, &uin, &alias, &nickname, &avatar, &userJSON,
-		&a.LoginBuffer, &credJSON, &status, &deviceID, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
+		&a.LoginBuffer, &credJSON, &status, &deviceID, &remark, &lastChecked, &a.CreatedAt, &a.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -476,6 +511,7 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	a.Avatar = stringPtrFromNull(avatar)
 	a.Status = stringPtrFromNull(status)
 	a.DeviceID = stringPtrFromNull(deviceID)
+	a.Remark = stringPtrFromNull(remark)
 	if lastChecked.Valid {
 		a.LastCheckedAt = &lastChecked.Int64
 	}

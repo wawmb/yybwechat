@@ -4,34 +4,51 @@
 package qr
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"yybwechat/internal/protocol"
 )
 
-// 微信 OAuth 相关 URL 常量
+// 微信 OAuth 相关常量。
+// AppID、回调地址、scope 与 state 抽成常量，便于公众号授权等场景复用同一套参数。
 const (
+	AppID            = "wxd44977328b36e647"
+	OAuthRedirectURI = "https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth?login_type=WX"
+	OAuthScope       = "snsapi_login,snsapi_runtime_pcsdk"
+	OAuthState       = "web"
+
+	// oauthURL 由上述常量拼接而成，拼接结果与旧版写法逐字节一致，避免改变登录行为。
 	oauthURL = "https://open.weixin.qq.com/connect/qrconnect" +
-		"?appid=wxd44977328b36e647" +
-		"&redirect_uri=https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth?login_type=WX" +
-		"&response_type=code&scope=snsapi_login,snsapi_runtime_pcsdk" +
-		"&state=web&fast_login=1&self_redirect=true"
+		"?appid=" + AppID +
+		"&redirect_uri=" + OAuthRedirectURI +
+		"&response_type=code&scope=" + OAuthScope +
+		"&state=" + OAuthState + "&fast_login=1&self_redirect=true"
 	callbackURL  = "https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth"
 	qrBase       = "https://open.weixin.qq.com/connect/qrcode/"
 	longPollBase = "https://long.open.weixin.qq.com/connect/l/qrconnect"
 )
+
+// 轮询长连接的超时时间。微信在未扫码时会挂起连接直到超时，属正常现象。
+const qrPollWait = 35 * time.Second
 
 // 正则表达式：分别用于提取二维码 UUID、微信错误码和授权码
 var (
@@ -98,6 +115,11 @@ func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
 	}
 	data, err := c.FetchQRCodeImage(ctx, sess)
 	if err != nil {
+		return ImageResult{}, err
+	}
+	// 校验返回内容确实是图片。代理或网络拦截时微信会返回 HTML/JSON，
+	// 若不校验会把脏数据当成二维码展示，用户看到的是一张坏图却无从判断原因。
+	if err := validateQRCodeImage(data); err != nil {
 		return ImageResult{}, err
 	}
 	return ImageResult{Session: sess, ImageBytes: data}, nil
@@ -173,7 +195,7 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 		"uuid": {sess.WXUUID},
 		"_":    {strconv.FormatInt(time.Now().UnixMilli(), 10)},
 	}.Encode()
-	reqCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, qrPollWait)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
@@ -182,6 +204,12 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := sess.HTTPClient.Do(req)
 	if err != nil {
+		// 长轮询超时是预期行为：用户还没扫码时微信会一直挂起连接。
+		// 降级为 pending 而不是报错，前端可继续轮询，避免扫码页面无故中断。
+		if errors.Is(err, context.DeadlineExceeded) {
+			sess.Status = "pending"
+			return PollResult{Status: "pending"}, nil
+		}
 		return PollResult{}, err
 	}
 	defer resp.Body.Close()
@@ -228,7 +256,7 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 	cb := callbackURL + "?" + url.Values{
 		"login_type": {"WX"},
 		"code":       {sess.AuthorizeCode},
-		"state":      {"web"},
+		"state":      {OAuthState},
 	}.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cb, nil)
 	if err != nil {
@@ -260,8 +288,27 @@ func (c *Client) RefreshLoginBuffer(ctx context.Context, creds protocol.LoginBuf
 	return c.loginBuffers.RefreshLoginBuffer(ctx, creds)
 }
 
-func DataURIJPEG(data []byte) string {
-	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data)
+// DataURIImage 按数据的真实 MIME 类型生成 data URI。
+// 相比硬编码 image/jpeg，PNG 等格式也能被浏览器正确渲染。
+func DataURIImage(data []byte) string {
+	mime := http.DetectContentType(data)
+	if strings.HasPrefix(mime, "application/") || mime == "text/plain; charset=utf-8" {
+		// 探测失败时退化为 jpeg，与历史行为保持一致
+		mime = "image/jpeg"
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// validateQRCodeImage 校验二维码响应是否为可解码的图片。
+// 网络或代理拦截时微信会返回 HTML 错误页，这里提前拦截并给出可诊断的提示。
+func validateQRCodeImage(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("二维码响应为空，可能被网络或代理拦截")
+	}
+	if _, _, err := image.DecodeConfig(bytes.NewReader(data)); err != nil {
+		return fmt.Errorf("二维码响应不是有效图片（可能被网络或代理拦截）: %w", err)
+	}
+	return nil
 }
 
 func parsePoll(text string) (*int, string) {

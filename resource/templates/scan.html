@@ -6,62 +6,22 @@
   <meta name="description" content="yybwechat — 扫码添加微信账号">
   <title>扫码添加账号 · yybwechat</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="stylesheet" href="/static/css/console.css">
   <style>
-    :root {
-      color-scheme: light;
-      --bg: oklch(1 0 0);
-      --bg-soft: oklch(0.974 0.004 250);
-      --surface: oklch(0.986 0.004 250);
-      --surface-strong: oklch(0.948 0.009 250);
-      --ink: oklch(0.19 0.025 252);
-      --muted: oklch(0.43 0.025 252);
-      --faint: oklch(0.58 0.018 252);
-      --line: oklch(0.885 0.012 250);
-      --primary: oklch(0.54 0.205 3);
-      --primary-hover: oklch(0.48 0.195 3);
-      --accent: oklch(0.44 0.112 190);
-      --success: oklch(0.55 0.135 145);
-      --success-soft: oklch(0.94 0.035 145);
-      --warning: oklch(0.68 0.135 78);
-      --danger: oklch(0.55 0.18 25);
-      --radius: 10px;
-    }
-
-    [data-theme="dark"] {
-      color-scheme: dark;
-      --bg: oklch(0.18 0.018 252);
-      --bg-soft: oklch(0.15 0.014 252);
-      --surface: oklch(0.21 0.019 252);
-      --surface-strong: oklch(0.26 0.022 252);
-      --ink: oklch(0.94 0.008 250);
-      --muted: oklch(0.68 0.018 252);
-      --faint: oklch(0.52 0.016 252);
-      --line: oklch(0.30 0.018 252);
-      --primary: oklch(0.65 0.20 3);
-      --primary-hover: oklch(0.58 0.19 3);
-      --accent: oklch(0.62 0.14 190);
-      --success: oklch(0.65 0.14 145);
-      --success-soft: oklch(0.26 0.04 145);
-      --warning: oklch(0.72 0.14 78);
-      --danger: oklch(0.65 0.18 25);
-    }
-
+    /* 页面专属：扫码卡片与状态展示，通用样式见 console.css */
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html { height: 100%; }
 
     body {
       min-height: 100%; display: grid; place-items: center;
       background: var(--bg-soft); color: var(--ink);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
       font-size: 14px; line-height: 1.5;
       padding: 20px;
     }
 
-    button { font: inherit; cursor: pointer; }
-
     .card {
       width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line);
-      border-radius: var(--radius); box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow: hidden;
+      border-radius: var(--radius-lg); box-shadow: var(--shadow-md); overflow: hidden;
     }
 
     .card-header {
@@ -141,23 +101,13 @@
     .result-box .result-meta { color: var(--muted); font-size: 12px; word-break: break-all; }
 
     /* ---- buttons ---- */
-    .btn {
-      min-height: 38px; border: 1px solid transparent; border-radius: var(--radius);
-      padding: 8px 18px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-      font-weight: 680; transition: background 160ms ease, border-color 160ms ease, color 160ms ease, opacity 160ms ease;
-      text-decoration: none;
-    }
-    .btn.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
-    .btn.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
-    .btn.secondary { border-color: var(--line); background: var(--bg); color: var(--ink); }
-    .btn.secondary:hover { background: var(--surface-strong); }
-    .btn:disabled { cursor: not-allowed; opacity: 0.55; }
-
     .btn-row {
       display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
     }
 
-    .hidden { display: none !important; }
+    @media (prefers-reduced-motion: reduce) {
+      .qr-wrapper .qr-spinner, .status-anim .dot { animation: none; }
+    }
   </style>
 </head>
 <body>
