@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="yybwechat — 代理设置">
+  <title>代理设置 · yybwechat</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="stylesheet" href="/static/css/console.css">
+  <style>
+    .app { min-height: 100vh; display: flex; flex-direction: column; }
+
+    .topbar {
+      height: var(--topbar-h); display: flex; align-items: center; justify-content: space-between; gap: 18px;
+      padding: 0 28px; background: linear-gradient(180deg, var(--bg), var(--bg-soft));
+      border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10;
+      backdrop-filter: blur(10px); box-shadow: var(--shadow-sm);
+    }
+    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+    .shell { width: min(1440px, 100%); margin: 0 auto; padding: 22px 28px 40px; display: grid; gap: 18px; }
+
+    .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+    .page-head h2 { margin: 0; font-size: 20px; font-weight: 760; letter-spacing: -0.01em; }
+    .page-head p { margin: 6px 0 0; color: var(--muted); max-width: 76ch; }
+
+    .card {
+      background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-sm); overflow: hidden;
+    }
+    .card-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 15px 18px; border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, var(--surface), var(--bg));
+    }
+    .card-head h3 { margin: 0; font-size: 15px; font-weight: 740; }
+    .card-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+
+    /* 配置库表单：一行排布，窄屏自动折行 */
+    .profile-form {
+      display: grid; gap: 12px; align-items: end; padding: 16px 18px;
+      grid-template-columns: minmax(150px, 1fr) repeat(3, minmax(120px, 0.75fr)) minmax(200px, 1.5fr) auto;
+    }
+    .profile-form .wide { grid-column: span 2; }
+    .profile-actions { display: flex; gap: 8px; align-items: center; }
+
+    .feedback {
+      min-height: 20px; padding: 0 18px 14px; color: var(--muted);
+      font-size: 12px; line-height: 1.5; overflow-wrap: anywhere;
+    }
+    .feedback.ok { color: var(--success); }
+    .feedback.error { color: var(--danger); }
+
+    .workspace { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); min-height: 560px; }
+    .accounts-pane { display: grid; grid-template-rows: auto minmax(0, 1fr); border-right: 1px solid var(--line); background: var(--surface); }
+    .accounts-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+    .accounts-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+    .accounts-title span { color: var(--muted); font-size: 12px; }
+    .accounts-list { min-height: 0; max-height: 720px; overflow: auto; }
+
+    .account-row {
+      width: 100%; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto; align-items: center;
+      gap: 10px; padding: 11px 14px; border: 0; border-bottom: 1px solid var(--line);
+      background: transparent; color: var(--ink); text-align: left; cursor: pointer; font: inherit;
+    }
+    .account-row:hover { background: var(--bg); }
+    .account-row[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+    .account-avatar {
+      width: 36px; height: 36px; border-radius: 50%; overflow: hidden; display: grid; place-items: center;
+      background: var(--surface-strong); color: var(--muted); font-weight: 750; font-size: 13px;
+    }
+    .account-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .account-copy { min-width: 0; }
+    .account-copy strong, .account-copy small {
+      display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .account-copy strong { font-size: 13px; font-weight: 700; }
+    .account-copy small { margin-top: 3px; color: var(--faint); font-size: 11px; }
+
+    .mode-badge {
+      display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px;
+      font-size: 11px; white-space: nowrap; border: 1px solid var(--line);
+      background: var(--surface-2); color: var(--muted);
+    }
+    .mode-badge.static { border-color: var(--accent-soft); background: var(--accent-soft); color: var(--accent); }
+    .mode-badge.api, .mode-badge.short { border-color: var(--warning-soft); background: var(--warning-soft); color: var(--warning); }
+    .mode-badge.profile { border-color: var(--success-soft); background: var(--success-soft); color: var(--success); }
+    .mode-badge.error { border-color: var(--danger-soft); background: var(--danger-soft); color: var(--danger); }
+
+    .editor { min-width: 0; padding: 22px 24px; }
+    .editor-empty { min-height: 380px; display: grid; place-items: center; color: var(--muted); text-align: center; }
+    .editor-head {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 20px;
+      padding-bottom: 16px; border-bottom: 1px solid var(--line);
+    }
+    .editor-head h3 { margin: 0; font-size: 17px; font-weight: 760; }
+    .editor-head p { margin: 5px 0 0; color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }
+    .editor-note { max-width: 340px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.55; text-align: right; }
+
+    .lifetime-notice {
+      display: none; margin-top: 14px; padding: 11px 13px; border-radius: var(--radius);
+      border: 1px solid var(--warning-soft); background: var(--warning-soft);
+      color: var(--warning); font-size: 12px; line-height: 1.55;
+    }
+    .lifetime-notice.visible { display: block; }
+
+    .mode-switch {
+      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px;
+      padding: 4px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2);
+    }
+    .mode-option { position: relative; min-width: 0; }
+    .mode-option input { position: absolute; opacity: 0; pointer-events: none; }
+    .mode-option label {
+      display: grid; place-items: center; min-height: 36px; padding: 6px 8px;
+      border-radius: var(--radius-sm); color: var(--muted); font-weight: 680; font-size: 12px;
+      cursor: pointer; text-align: center;
+    }
+    .mode-option input:checked + label { background: var(--bg); color: var(--ink); box-shadow: var(--shadow-sm); }
+    .mode-option input:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
+    .form-grid > * { min-width: 0; }
+    .form-grid .wide { grid-column: 1 / -1; }
+    .field-note { display: block; margin-top: 6px; color: var(--faint); font-size: 11px; line-height: 1.5; }
+
+    .refresh-line { display: flex; align-items: center; gap: 12px; }
+    .refresh-line input[type="range"] { flex: 1; min-width: 100px; accent-color: var(--primary); }
+    .refresh-value { min-width: 96px; color: var(--ink); font-variant-numeric: tabular-nums; }
+    .refresh-estimate { display: block; margin-top: 6px; color: var(--success); font-size: 12px; font-weight: 700; }
+
+    .editor-feedback {
+      min-height: 44px; margin-top: 16px; padding: 11px 12px; border: 1px solid var(--line);
+      border-radius: var(--radius); background: var(--surface); color: var(--muted);
+      font-size: 12px; line-height: 1.5; overflow-wrap: anywhere;
+    }
+    .editor-feedback.ok { color: var(--success); border-color: var(--success-soft); background: var(--success-soft); }
+    .editor-feedback.error { color: var(--danger); border-color: var(--danger-soft); background: var(--danger-soft); }
+
+    .editor-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+
+    .list-empty { padding: 28px 16px; color: var(--muted); text-align: center; font-size: 12px; }
+
+    [hidden] { display: none !important; }
+
+    @media (max-width: 1080px) {
+      .profile-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .profile-form .wide { grid-column: 1 / -1; }
+      .profile-actions { justify-content: flex-end; }
+    }
+    @media (max-width: 920px) {
+      .workspace { grid-template-columns: minmax(0, 1fr); }
+      .accounts-pane { border-right: 0; border-bottom: 1px solid var(--line); }
+      .accounts-list { max-height: 280px; }
+      .editor { padding: 18px; }
+    }
+    @media (max-width: 760px) {
+      .topbar { height: auto; flex-direction: column; align-items: flex-start; padding: 14px 16px; }
+      .top-actions { width: 100%; }
+      .top-actions .btn { flex: 1; }
+      .shell { padding: 16px; }
+      .page-head { flex-direction: column; }
+      .editor-head { flex-direction: column; }
+      .editor-note { max-width: none; text-align: left; }
+      .form-grid, .mode-switch, .profile-form { grid-template-columns: minmax(0, 1fr); }
+      .form-grid .wide, .profile-form .wide { grid-column: auto; }
+      .profile-actions, .editor-actions { flex-direction: column-reverse; align-items: stretch; }
+      .profile-actions .btn, .editor-actions .btn { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">Y</div>
+        <div>
+          <h1 class="brand-title">代理设置</h1>
+          <div class="brand-subtitle">供应商配置库 · 账号级出口 · 地区选择</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="btn ghost" id="themeToggle" title="切换主题" aria-label="切换深色/浅色模式">🌓</button>
+        <a class="btn secondary" id="backToAccount" href="/">← 返回账号工作台</a>
+        <button class="btn secondary" id="reloadBtn" type="button">重新加载</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <div class="page-head">
+        <div>
+          <h2>把提取链接存成配置，再给每个账号选出口</h2>
+          <p>静态代理可用于账号保活；动态提取（品赞 / 巨量）每次都会换出口，只能用于扫码和临时请求，系统不会用它做自动保活。</p>
+        </div>
+      </div>
+
+      <!-- 供应商配置库 -->
+      <section class="card" id="profileCard" aria-labelledby="profileTitle">
+        <div class="card-head">
+          <div>
+            <h3 id="profileTitle">代理配置库</h3>
+            <p>集中保存品赞、巨量或静态代理预设，账号只需引用配置并单独选择省市。</p>
+          </div>
+          <select class="input" id="profilePicker" aria-label="选择代理配置" style="min-width:180px">
+            <option value="new">＋ 新增配置</option>
+          </select>
+        </div>
+        <form class="profile-form" id="profileForm">
+          <div class="field">
+            <label for="profileName">配置名称</label>
+            <input class="input" id="profileName" maxlength="50" placeholder="例如：品赞 主力" required>
+          </div>
+          <div class="field">
+            <label for="profileProvider">配置类型</label>
+            <select class="input" id="profileProvider">
+              <option value="ipzan">品赞</option>
+              <option value="juliang">巨量</option>
+              <option value="static">静态代理预设</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="profileType">代理协议</label>
+            <select class="input" id="profileType">
+              <option value="http">HTTP CONNECT</option>
+              <option value="socks5">SOCKS5</option>
+            </select>
+          </div>
+          <div class="field" id="profileAuthField">
+            <label for="profileAuthorization">授权方式</label>
+            <select class="input" id="profileAuthorization">
+              <option value="auth">账号密码（推荐）</option>
+              <option value="whitelist">出口 IP 白名单</option>
+            </select>
+          </div>
+          <div class="field wide" id="profileURLField">
+            <label for="profileURL" id="profileURLLabel">品赞提取链接</label>
+            <input class="input" id="profileURL" type="text" autocomplete="off" spellcheck="false"
+                   placeholder="https://service.ipzan.com/core-extract?...">
+            <span class="field-note" id="profileURLNote">粘贴含 no 与 secret 的提取链接即可，系统会统一为每次 1 个 IP。</span>
+          </div>
+          <div class="field" id="juliangTradeField" hidden>
+            <label for="juliangTradeNo">巨量业务编号</label>
+            <input class="input" id="juliangTradeNo" inputmode="numeric" maxlength="32" autocomplete="off">
+          </div>
+          <div class="field wide" id="juliangKeyField" hidden>
+            <label for="juliangAPIKey">巨量 API Key</label>
+            <input class="input" id="juliangAPIKey" type="password" maxlength="32" autocomplete="new-password" spellcheck="false">
+            <span class="field-note">32 位十六进制字符串，仅保存在本机数据库。</span>
+          </div>
+          <div class="profile-actions">
+            <button class="btn danger" id="deleteProfile" type="button" hidden>删除</button>
+            <button class="btn primary" id="saveProfile" type="submit">添加配置</button>
+          </div>
+        </form>
+        <div class="feedback" id="profileFeedback" role="status">账号密码授权不依赖本机公网 IP；每个账号可独立选择省市。</div>
+      </section>
+
+      <!-- 账号代理 -->
+      <section class="card" aria-label="账号代理管理">
+        <div class="workspace">
+          <aside class="accounts-pane">
+            <div class="accounts-head">
+              <div class="accounts-title"><strong>微信账号</strong><span id="accountCount">加载中…</span></div>
+              <input class="input" id="accountSearch" type="search" placeholder="搜索昵称、备注或 ID" aria-label="搜索微信账号">
+            </div>
+            <div class="accounts-list" id="accountList">
+              <div class="skeleton" style="height:60px"></div>
+              <div class="skeleton" style="height:60px"></div>
+              <div class="skeleton" style="height:60px"></div>
+            </div>
+          </aside>
+
+          <div class="editor">
+            <div class="editor-empty" id="editorEmpty">选择一个账号后管理它的代理。</div>
+            <div id="editor" hidden>
+              <div class="editor-head">
+                <div>
+                  <h3 id="editorName">未选择</h3>
+                  <p id="editorMeta"></p>
+                </div>
+                <p class="editor-note">扫码与保活使用账号连接模式；小程序调用可单独选择直连。代理失败不会自动切换出口。</p>
+              </div>
+
+              <div class="lifetime-notice" id="lifetimeNotice" role="status"></div>
+
+              <form class="proxy-form" id="proxyForm">
+                <fieldset style="min-width:0;margin:18px 0 0;padding:0;border:0">
+                  <legend style="margin-bottom:9px;font-weight:700">连接模式</legend>
+                  <div class="mode-switch">
+                    <div class="mode-option"><input id="modeDirect" name="proxyMode" type="radio" value="direct" checked><label for="modeDirect">直连</label></div>
+                    <div class="mode-option"><input id="modeStatic" name="proxyMode" type="radio" value="static"><label for="modeStatic">静态代理</label></div>
+                    <div class="mode-option"><input id="modeAPI" name="proxyMode" type="radio" value="api"><label for="modeAPI">自定义 API</label></div>
+                    <div class="mode-option"><input id="modeProfile" name="proxyMode" type="radio" value="profile"><label for="modeProfile">配置库</label></div>
+                  </div>
+                </fieldset>
+
+                <div class="form-grid">
+                  <div class="field" id="proxyTypeField">
+                    <label for="proxyType">代理协议</label>
+                    <select class="input" id="proxyType">
+                      <option value="http">HTTP CONNECT</option>
+                      <option value="socks5">SOCKS5</option>
+                    </select>
+                  </div>
+
+                  <div class="field wide" id="staticField" hidden>
+                    <label for="staticProxy">代理地址</label>
+                    <input class="input" id="staticProxy" autocomplete="off" spellcheck="false" placeholder="user:pass@127.0.0.1:8080">
+                    <span class="field-note">支持 IP:端口、用户名:密码@IP:端口，以及完整代理 URL（含 socks5://）。</span>
+                  </div>
+
+                  <div class="field wide" id="apiField" hidden>
+                    <label for="proxyAPI">代理提取 API</label>
+                    <input class="input" id="proxyAPI" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com/get?num=1">
+                    <span class="field-note">支持 txt、json、json2 与常见嵌套响应；每次提取都会得到新的出口。</span>
+                  </div>
+
+                  <div class="field wide" id="profileSelectField" hidden>
+                    <label for="accountProfile">供应商配置</label>
+                    <select class="input" id="accountProfile"></select>
+                    <span class="field-note">凭证在上方配置库统一维护，地区按账号分别保存。</span>
+                  </div>
+
+                  <div class="field" id="provinceField" hidden>
+                    <label for="accountProvince">省份</label>
+                    <select class="input" id="accountProvince"><option value="all">全国</option></select>
+                  </div>
+
+                  <div class="field" id="cityField" hidden>
+                    <label for="accountCity">城市</label>
+                    <select class="input" id="accountCity"><option value="">全省</option></select>
+                  </div>
+
+                  <div class="field wide" id="refreshField" hidden>
+                    <label for="refreshAhead">提前刷新</label>
+                    <div class="refresh-line">
+                      <input id="refreshAhead" type="range" min="5" max="90" step="5" value="5">
+                      <output class="refresh-value" id="refreshValue" for="refreshAhead">提前 5 分钟</output>
+                    </div>
+                    <strong class="refresh-estimate" id="refreshEstimate">预计约 115 分钟刷新一次</strong>
+                    <span class="field-note" id="refreshBasis">按该账号凭据有效期计算。提前量越小，刷新周期越长，提取代理的次数越少。</span>
+                  </div>
+
+                  <div class="field wide">
+                    <label for="protocolProxyMode">小程序调用出口</label>
+                    <select class="input" id="protocolProxyMode">
+                      <option value="account">跟随账号连接模式（默认）</option>
+                      <option value="direct">直连</option>
+                    </select>
+                    <span class="field-note">仅影响取码、手机号和小程序数据接口。扫码与保活仍用账号连接模式；「测试代理」只检测上方代理。</span>
+                  </div>
+                </div>
+
+                <div class="editor-feedback" id="editorFeedback" role="status" aria-live="polite">正在读取代理配置。</div>
+                <div class="editor-actions">
+                  <button class="btn secondary" id="locateBtn" type="button" title="按当前浏览器定位推荐地区">按位置推荐地区</button>
+                  <button class="btn secondary" id="testBtn" type="button">测试代理</button>
+                  <button class="btn primary" id="saveBtn" type="submit">保存代理</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    // 与账号工作台共用同一个主题键，两个页面切换保持一致
+    (function initTheme() {
+      const saved = localStorage.getItem("yybwechat-theme");
+      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      if (saved === "dark" || (!saved && prefersDark)) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+
+    const state = {
+      accounts: [],
+      configs: new Map(),
+      profiles: [],
+      provinces: [],
+      cities: new Map(),
+      selectedID: "",
+      tokenTTLMinutes: 120,
+      editorVersion: 0,
+      editorReady: false,
+    };
+
+    const modeLabels = { direct: "直连", static: "静态", api: "短效 API", profile: "配置库" };
+    const providerLabels = { ipzan: "品赞", juliang: "巨量", static: "静态预设" };
+
+    function escapeHTML(value) {
+      const node = document.createElement("span");
+      node.textContent = value ?? "";
+      return node.innerHTML;
+    }
+
+    async function api(method, url, body) {
+      const options = { method, headers: { "Content-Type": "application/json" } };
+      if (body !== undefined) options.body = JSON.stringify(body);
+      const response = await fetch(url, options);
+      const text = await response.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      const isEnvelope = data && typeof data === "object" && !Array.isArray(data)
+        && Object.prototype.hasOwnProperty.call(data, "code")
+        && Object.prototype.hasOwnProperty.call(data, "msg")
+        && Object.prototype.hasOwnProperty.call(data, "data");
+      if (response.status === 401) {
+        location.href = "/login?next=" + encodeURIComponent(location.pathname + location.search);
+        throw new Error("登录已失效");
+      }
+      if (!response.ok || (isEnvelope && data.code !== 0)) {
+        const error = new Error(isEnvelope ? data.msg : ("HTTP " + response.status));
+        error.status = response.status;
+        throw error;
+      }
+      return isEnvelope ? data.data : data;
+    }
+
+    function accountName(account) {
+      return account.remark || account.nickname || account.alias || account.openid || "未命名账号";
+    }
+    function statusText(status) {
+      return status === "alive" ? "可用" : status === "expired" ? "需重扫" : "待确认";
+    }
+    function currentAccount() {
+      return state.accounts.find(item => String(item.id) === state.selectedID) || null;
+    }
+    function currentMode() {
+      return document.querySelector('input[name="proxyMode"]:checked')?.value || "direct";
+    }
+    function currentProfile() {
+      const picked = $("profilePicker").value;
+      return state.profiles.find(item => String(item.id) === String(picked)) || null;
+    }
+
+    // 从已保存的 API 地址里还原授权方式与巨量凭证，便于二次编辑
+    function profileAuthorization(profile) {
+      try {
+        return new URL(profile?.api_url || "").searchParams.get("mode") === "whitelist" ? "whitelist" : "auth";
+      } catch { return "auth"; }
+    }
+    function juliangCredentials(profile) {
+      try {
+        const url = new URL(profile?.api_url || "");
+        return { tradeNo: url.searchParams.get("trade_no") || "", apiKey: url.searchParams.get("key") || "" };
+      } catch { return { tradeNo: "", apiKey: "" }; }
+    }
+
+    function setProfileFeedback(message, kind = "") {
+      const node = $("profileFeedback");
+      node.textContent = message;
+      node.className = ("feedback " + kind).trim();
+    }
+    function setFeedback(message, kind = "") {
+      const node = $("editorFeedback");
+      node.textContent = message;
+      node.className = ("editor-feedback " + kind).trim();
+    }
+
+    function renderProfileOptions() {
+      const options = state.profiles
+        .map(profile => `<option value="${profile.id}">${escapeHTML(profile.name)} · ${providerLabels[profile.provider] || escapeHTML(profile.provider)}</option>`)
+        .join("");
+      $("profilePicker").innerHTML = `<option value="new">＋ 新增配置</option>${options}`;
+      const previous = $("accountProfile").value;
+      $("accountProfile").innerHTML = options || '<option value="">请先在上方添加配置</option>';
+      if (previous) $("accountProfile").value = previous;
+    }
+
+    function toggleProfileFields() {
+      const provider = $("profileProvider").value;
+      const isJuliang = provider === "juliang";
+      const isStatic = provider === "static";
+      $("profileURLField").hidden = isJuliang;
+      $("profileAuthField").hidden = isStatic;
+      $("juliangTradeField").hidden = !isJuliang;
+      $("juliangKeyField").hidden = !isJuliang;
+      $("profileURL").required = !isJuliang;
+      $("juliangTradeNo").required = isJuliang;
+      $("juliangAPIKey").required = isJuliang;
+      $("profileURLLabel").textContent = isStatic ? "静态代理地址" : "品赞提取链接";
+      $("profileURL").placeholder = isStatic ? "user:pass@127.0.0.1:8080" : "https://service.ipzan.com/core-extract?...";
+      $("profileURLNote").textContent = isStatic
+        ? "固定出口，可用于账号保活；请确认地址长期有效。"
+        : "粘贴含 no 与 secret 的提取链接即可，系统会统一为每次 1 个 IP。";
+      setProfileFeedback(
+        isStatic ? "静态预设会原样复用固定出口，可用于账号保活。"
+          : isJuliang ? "巨量按账号省市动态签名，账号密码模式无需维护出口 IP 白名单。"
+            : "品赞账号密码模式会读取临时代理账号，不依赖本机公网 IP。"
+      );
+    }
+
+    function editProfile(id) {
+      const profile = state.profiles.find(item => String(item.id) === String(id));
+      const credentials = juliangCredentials(profile);
+      $("profilePicker").value = profile ? String(profile.id) : "new";
+      $("profileName").value = profile?.name || "";
+      $("profileProvider").value = profile?.provider || "ipzan";
+      $("profileType").value = profile?.proxy_type || "http";
+      $("profileAuthorization").value = profile ? profileAuthorization(profile) : "auth";
+      $("profileURL").value = (profile?.provider === "ipzan" || profile?.provider === "static") ? (profile.api_url || "") : "";
+      $("juliangTradeNo").value = credentials.tradeNo;
+      $("juliangAPIKey").value = credentials.apiKey;
+      $("deleteProfile").hidden = !profile;
+      $("saveProfile").textContent = profile ? "保存配置" : "添加配置";
+      toggleProfileFields();
+    }
+
+    async function loadProfiles() {
+      state.profiles = await api("GET", "/api/proxy-profiles");
+      renderProfileOptions();
+      editProfile($("profilePicker").value === "new" ? "new" : $("profilePicker").value);
+    }
+
+    async function loadProvinces() {
+      try {
+        state.provinces = await api("GET", "/api/proxy-profiles/areas/provinces");
+        $("accountProvince").innerHTML = '<option value="all">全国</option>' + state.provinces
+          .map(area => `<option value="${escapeHTML(area.code)}">${escapeHTML(area.name)}</option>`)
+          .join("");
+      } catch (error) {
+        // 地区列表来自供应商接口，失败不应阻断整个页面
+        setProfileFeedback(`地区列表读取失败：${error.message}`, "error");
+      }
+    }
+
+    async function loadCities(province, selected = "", version = null) {
+      const target = $("accountCity");
+      if (!province || province === "all") {
+        if (version === null || version === state.editorVersion) target.innerHTML = '<option value="">全省</option>';
+        return true;
+      }
+      let cities = state.cities.get(province);
+      if (!cities) {
+        cities = await api("GET", `/api/proxy-profiles/areas/cities?province=${encodeURIComponent(province)}`);
+        state.cities.set(province, cities);
+      }
+      // 期间用户可能已切到别的账号，丢弃这次结果避免串台
+      if (version !== null && version !== state.editorVersion) return false;
+      target.innerHTML = '<option value="">全省</option>' + cities
+        .map(area => `<option value="${escapeHTML(area.code)}">${escapeHTML(area.name)}</option>`)
+        .join("");
+      target.value = selected || "";
+      return true;
+    }
+
+    function renderAccountList() {
+      const query = $("accountSearch").value.trim().toLowerCase();
+      const accounts = state.accounts.filter(account => !query
+        || accountName(account).toLowerCase().includes(query)
+        || String(account.id).includes(query)
+        || (account.openid || "").toLowerCase().includes(query));
+      $("accountCount").textContent = `${state.accounts.length} 个账号`;
+      $("accountList").innerHTML = accounts.map(account => {
+        const name = accountName(account);
+        const config = state.configs.get(String(account.id));
+        const mode = config ? (config.provider_profile_id ? "profile" : config.mode) : "error";
+        return `<button class="account-row" type="button" data-account-id="${account.id}" aria-pressed="${String(account.id) === state.selectedID}">
+          <span class="account-avatar"><img src="/accounts/avatar?ref=${encodeURIComponent(account.id)}" alt=""><span hidden>${escapeHTML(Array.from(name)[0] || "Y")}</span></span>
+          <span class="account-copy"><strong>${escapeHTML(name)}</strong><small>ID ${account.id} · ${escapeHTML(statusText(account.status))}</small></span>
+          <span class="mode-badge ${mode}">${modeLabels[mode] || "读取失败"}</span>
+        </button>`;
+      }).join("") || '<div class="list-empty">没有符合条件的账号。</div>';
+      $("accountList").querySelectorAll("img").forEach(image => {
+        image.addEventListener("error", () => {
+          image.hidden = true;
+          if (image.nextElementSibling) image.nextElementSibling.hidden = false;
+        });
+      });
+    }
+
+    function toggleFields() {
+      const mode = currentMode();
+      const dynamic = mode === "api" || mode === "profile";
+      $("proxyTypeField").hidden = mode === "direct" || mode === "profile";
+      $("staticField").hidden = mode !== "static";
+      $("apiField").hidden = mode !== "api";
+      $("profileSelectField").hidden = mode !== "profile";
+      $("provinceField").hidden = mode !== "profile";
+      $("cityField").hidden = mode !== "profile";
+      $("refreshField").hidden = !dynamic;
+      $("staticProxy").required = mode === "static";
+      $("proxyAPI").required = mode === "api";
+      $("accountProfile").required = mode === "profile";
+    }
+
+    function renderRefreshEstimate() {
+      const ahead = Number($("refreshAhead").value) || 5;
+      const ttl = state.tokenTTLMinutes || 120;
+      const cycle = Math.max(1, ttl - ahead);
+      $("refreshValue").textContent = `提前 ${ahead} 分钟`;
+      $("refreshEstimate").textContent = `预计约 ${cycle} 分钟刷新一次`;
+      $("refreshBasis").textContent = `按该账号凭据 ${ttl} 分钟有效期计算。提前量越小，刷新周期越长，提取代理的次数越少。动态代理只用于临时请求，系统不会用它做自动保活。`;
+    }
+
+    async function fillEditor(account, config) {
+      const version = ++state.editorVersion;
+      state.editorReady = false;
+      $("editorEmpty").hidden = true;
+      $("editor").hidden = false;
+      $("editorName").textContent = accountName(account);
+      $("editorMeta").textContent = `账号 ID ${account.id} · OpenID ${account.openid || "—"}`;
+
+      const notice = $("lifetimeNotice");
+      notice.textContent = config?.proxy_warning || "";
+      notice.classList.toggle("visible", Boolean(config?.proxy_warning));
+
+      setFeedback("正在读取账号代理配置。");
+      const mode = config?.provider_profile_id ? "profile" : (config?.mode || "direct");
+      const targetInput = document.querySelector(`input[name="proxyMode"][value="${mode}"]`) || $("modeDirect");
+      targetInput.checked = true;
+      $("protocolProxyMode").value = config?.protocol_proxy_mode || "account";
+      $("proxyType").value = config?.proxy_type || "http";
+      $("staticProxy").value = config?.static_proxy || "";
+      $("proxyAPI").value = config?.api_url || "";
+      $("accountProfile").value = config?.provider_profile_id
+        ? String(config.provider_profile_id)
+        : (state.profiles[0] ? String(state.profiles[0].id) : "");
+
+      // 品赞地区编码是 6 位，省级 = 前两位 + 0000
+      const provinceCode = config?.region_code ? `${config.region_code.slice(0, 2)}0000` : "all";
+      $("accountProvince").value = provinceCode;
+      try {
+        if (!await loadCities(provinceCode, config?.region_code || "", version)) return;
+      } catch (error) {
+        if (version === state.editorVersion) setFeedback(`城市列表读取失败：${error.message}`, "error");
+        return;
+      }
+      if (version !== state.editorVersion || state.selectedID !== String(account.id)) return;
+
+      $("refreshAhead").value = String(config?.refresh_ahead_minutes || 5);
+      state.tokenTTLMinutes = Number(config?.token_ttl_minutes) || 120;
+      renderRefreshEstimate();
+      toggleFields();
+      state.editorReady = true;
+
+      const profile = state.profiles.find(item => item.id === config?.provider_profile_id);
+      const provider = providerLabels[profile?.provider] || "供应商";
+      if (!config?.configured) {
+        setFeedback("当前为直连。选择任一模式后保存即可切换到代理。");
+      } else if (config.provider_profile_id) {
+        const region = [config.region_province, config.region_city].filter(Boolean).join(" / ") || "全国";
+        setFeedback(`已使用配置「${profile?.name || "#" + config.provider_profile_id}」（${provider}），地区 ${region}。`);
+      } else {
+        setFeedback(`当前为${modeLabels[config.mode] || config.mode}模式。`);
+      }
+    }
+
+    function setReturnLink(id) {
+      const requested = new URLSearchParams(location.search).get("return");
+      $("backToAccount").href = requested && requested.startsWith("/") && !requested.startsWith("//")
+        ? requested
+        : `/?ref=${encodeURIComponent(id || "")}`;
+    }
+
+    async function selectAccount(id, updateURL = true) {
+      const account = state.accounts.find(item => String(item.id) === String(id));
+      if (!account) return;
+      state.editorVersion++;
+      state.editorReady = false;
+      state.selectedID = String(account.id);
+      renderAccountList();
+      if (updateURL) history.replaceState(null, "", `/proxies?ref=${encodeURIComponent(account.id)}`);
+      setReturnLink(account.id);
+
+      let config = state.configs.get(state.selectedID);
+      if (!config) {
+        setFeedback("正在读取代理配置。");
+        try {
+          config = await api("GET", `/accounts/proxy?ref=${encodeURIComponent(account.id)}`);
+          state.configs.set(String(account.id), config);
+        } catch (error) {
+          if (state.selectedID === String(account.id)) setFeedback(`读取失败：${error.message}`, "error");
+          return;
+        }
+      }
+      if (state.selectedID === String(account.id)) await fillEditor(account, config);
+    }
+
+    // 组装保存/测试用的请求体；配置库模式下把区县编码做为 region_code 上送
+    function proxyPayload() {
+      const account = currentAccount();
+      const mode = currentMode();
+      const profileMode = mode === "profile";
+      const city = $("accountCity").value;
+      const province = $("accountProvince");
+      const provinceName = province.options[province.selectedIndex]?.text || "";
+      const cityName = city ? ($("accountCity").options[$("accountCity").selectedIndex]?.text || "") : "";
+      return {
+        ref: String(account.id),
+        mode: profileMode ? "api" : mode,
+        protocol_proxy_mode: $("protocolProxyMode").value,
+        proxy_type: $("proxyType").value,
+        static_proxy: $("staticProxy").value.trim(),
+        api_url: $("proxyAPI").value.trim(),
+        provider_profile_id: profileMode && $("accountProfile").value ? Number($("accountProfile").value) : null,
+        region_code: profileMode ? (city || province.value) : "",
+        region_province: profileMode && province.value !== "all" ? provinceName : "",
+        region_city: profileMode ? cityName : "",
+        refresh_ahead_minutes: Number($("refreshAhead").value),
+      };
+    }
+
+    async function loadPage() {
+      $("accountList").innerHTML = '<div class="skeleton" style="height:60px"></div><div class="skeleton" style="height:60px"></div>';
+      await Promise.all([loadProfiles(), loadProvinces()]);
+      state.accounts = await api("GET", "/accounts");
+      state.configs.clear();
+      await Promise.all(state.accounts.map(async account => {
+        try {
+          state.configs.set(String(account.id), await api("GET", `/accounts/proxy?ref=${encodeURIComponent(account.id)}`));
+        } catch { /* 单个账号读取失败不影响其它账号，徽章会显示「读取失败」 */ }
+      }));
+      const requested = new URLSearchParams(location.search).get("ref");
+      const initial = state.accounts.find(account => String(account.id) === String(requested)) || state.accounts[0];
+      state.selectedID = initial ? String(initial.id) : "";
+      renderAccountList();
+      if (initial) {
+        setReturnLink(initial.id);
+        await fillEditor(initial, state.configs.get(state.selectedID));
+      } else {
+        $("editor").hidden = true;
+        $("editorEmpty").hidden = false;
+        $("editorEmpty").textContent = "暂无账号，请先添加微信账号。";
+      }
+    }
+
+    // ---- 事件绑定 ----
+
+    $("themeToggle").addEventListener("click", () => {
+      const isDark = document.documentElement.hasAttribute("data-theme");
+      if (isDark) {
+        document.documentElement.removeAttribute("data-theme");
+        localStorage.setItem("yybwechat-theme", "light");
+      } else {
+        document.documentElement.setAttribute("data-theme", "dark");
+        localStorage.setItem("yybwechat-theme", "dark");
+      }
+    });
+
+    $("profilePicker").addEventListener("change", event => editProfile(event.target.value));
+    $("profileProvider").addEventListener("change", toggleProfileFields);
+
+    $("profileForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const current = currentProfile();
+      const button = $("saveProfile");
+      const provider = $("profileProvider").value;
+      button.disabled = true;
+      setProfileFeedback(current ? "正在保存配置。" : "正在添加配置。");
+      try {
+        const authorization = $("profileAuthorization").value;
+        const body = {
+          name: $("profileName").value.trim(),
+          provider,
+          proxy_type: $("profileType").value,
+          authorization_mode: authorization,
+          api_url: (provider === "ipzan" || provider === "static") ? $("profileURL").value.trim() : "",
+          trade_no: provider === "juliang" ? $("juliangTradeNo").value.trim() : "",
+          api_key: provider === "juliang" ? $("juliangAPIKey").value.trim() : "",
+        };
+        const saved = await api(current ? "PUT" : "POST", current ? `/api/proxy-profiles/${current.id}` : "/api/proxy-profiles", body);
+        await loadProfiles();
+        $("profilePicker").value = String(saved.id);
+        editProfile(saved.id);
+        const supplier = providerLabels[saved.provider] || saved.provider;
+        setProfileFeedback(
+          provider === "static" ? `已保存「${saved.name}」（${supplier}），账号可直接选用这个固定出口。`
+            : authorization === "auth" ? `已保存「${saved.name}」（${supplier}），使用临时代理账号密码。`
+              : `已保存「${saved.name}」（${supplier}），请确认本机公网 IP 已在供应商白名单。`,
+          "ok"
+        );
+        // 配置变了，重新拉一次当前账号的配置以刷新徽章
+        const account = currentAccount();
+        if (account) {
+          const config = await api("GET", `/accounts/proxy?ref=${encodeURIComponent(account.id)}`);
+          state.configs.set(state.selectedID, config);
+          renderAccountList();
+          await fillEditor(account, config);
+        }
+      } catch (error) {
+        setProfileFeedback(`保存失败：${error.message}`, "error");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $("deleteProfile").addEventListener("click", async () => {
+      const profile = currentProfile();
+      if (!profile || !confirm(`删除配置「${profile.name}」？引用该配置的账号会退回直连。`)) return;
+      try {
+        await api("DELETE", `/api/proxy-profiles/${profile.id}`);
+        await loadProfiles();
+        setProfileFeedback("配置已删除。", "ok");
+      } catch (error) {
+        setProfileFeedback(`删除失败：${error.message}`, "error");
+      }
+    });
+
+    $("accountList").addEventListener("click", event => {
+      const button = event.target.closest("[data-account-id]");
+      if (button) selectAccount(button.dataset.accountId);
+    });
+    $("accountSearch").addEventListener("input", renderAccountList);
+    document.querySelectorAll('input[name="proxyMode"]').forEach(input => input.addEventListener("change", toggleFields));
+    $("accountProvince").addEventListener("change", event => {
+      loadCities(event.target.value).catch(error => setFeedback(`城市列表读取失败：${error.message}`, "error"));
+    });
+    $("refreshAhead").addEventListener("input", renderRefreshEstimate);
+
+    // 按浏览器定位推荐地区：拿不到定位时后端会退回 IP 归属地
+    $("locateBtn").addEventListener("click", () => {
+      if (!currentAccount()) return;
+      if (currentMode() !== "profile") {
+        setFeedback("地区推荐只对「配置库」模式生效，请先切换到配置库并选择供应商。", "error");
+        return;
+      }
+      const button = $("locateBtn");
+      button.disabled = true;
+      setFeedback("正在按位置匹配代理地区…");
+      const finish = (lat, lon) => {
+        const body = lat != null && lon != null ? { latitude: lat, longitude: lon } : {};
+        api("POST", "/api/proxy-location/recommend", body)
+          .then(location => {
+            const region = [location.province, location.city].filter(Boolean).join(" / ") || "全国";
+            if (location.province_code) {
+              const provinceCode = `${location.province_code.slice(0, 2)}0000`;
+              $("accountProvince").value = provinceCode;
+              loadCities(provinceCode, location.city_code || "").then(() => {
+                setFeedback(`已按${location.source === "geolocation" ? "浏览器定位" : "IP 归属地"}推荐：${region}。保存后生效。`, "ok");
+              });
+            } else {
+              setFeedback(`已定位到 ${region}，但没有匹配到供应商地区编码，请手动选择。`, "error");
+            }
+          })
+          .catch(error => setFeedback(`地区推荐失败：${error.message}`, "error"))
+          .finally(() => { button.disabled = false; });
+      };
+      if (!navigator.geolocation) {
+        finish(null, null);
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        position => finish(position.coords.latitude, position.coords.longitude),
+        () => finish(null, null),
+        { timeout: 8000, maximumAge: 600000 }
+      );
+    });
+
+    $("testBtn").addEventListener("click", async () => {
+      if (!currentAccount() || !$("proxyForm").reportValidity()) return;
+      if (!state.editorReady) {
+        setFeedback("账号配置仍在读取，请稍后再试。", "error");
+        return;
+      }
+      const button = $("testBtn");
+      button.disabled = true;
+      setFeedback("正在提取并校验代理出口。");
+      try {
+        const result = await api("POST", "/accounts/proxy/test", proxyPayload());
+        const exit = [result.exit_region, result.exit_city].filter(Boolean).join("");
+        if (!result.resolved) {
+          setFeedback("当前为直连模式，无需测试代理。", "ok");
+        } else if (exit) {
+          setFeedback(`代理可用：实际出口 ${exit}${result.exit_ip ? ` · ${result.exit_ip}` : ""}；入口节点 ${result.proxy}`, "ok");
+        } else {
+          setFeedback(`已提取入口节点 ${result.proxy}，但出口检测失败${result.probe_error ? `：${result.probe_error}` : ""}`, "error");
+        }
+      } catch (error) {
+        setFeedback(`代理测试失败：${error.message}`, "error");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $("proxyForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const account = currentAccount();
+      if (!account) return;
+      if (!state.editorReady) {
+        setFeedback("账号配置仍在读取，未执行保存。", "error");
+        return;
+      }
+      const previous = state.configs.get(state.selectedID);
+      const next = proxyPayload();
+      if (previous?.configured && next.mode === "direct"
+        && !confirm(`账号 ${account.id} 当前正在使用代理，确定切换为直连吗？`)) {
+        return;
+      }
+      const button = $("saveBtn");
+      button.disabled = true;
+      setFeedback("正在保存代理配置。");
+      try {
+        const savedID = state.selectedID;
+        const config = await api("PUT", "/accounts/proxy", next);
+        state.configs.set(savedID, config);
+        renderAccountList();
+        if (state.selectedID === savedID) await fillEditor(account, config);
+        setFeedback(config.configured ? "代理已保存，会话缓存已作废。" : "已切换为直连，会话缓存已作废。", "ok");
+      } catch (error) {
+        setFeedback(`保存失败：${error.message}`, "error");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    $("reloadBtn").addEventListener("click", () => {
+      state.cities.clear();
+      loadPage().catch(error => {
+        $("accountList").innerHTML = `<div class="list-empty">加载失败：${escapeHTML(error.message)}</div>`;
+      });
+    });
+
+    loadPage().catch(error => {
+      $("accountCount").textContent = "加载失败";
+      $("accountList").innerHTML = `<div class="list-empty">${escapeHTML(error.message)}</div>`;
+    });
+  </script>
+</body>
+</html>

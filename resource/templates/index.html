@@ -145,6 +145,39 @@
     .credential-chip.soon { border-color: var(--warning-soft); background: var(--warning-soft); color: var(--warning); }
     .credential-chip.gone { border-color: var(--danger-soft); background: var(--danger-soft); color: var(--danger); }
 
+    /* 账号双轨生命周期：上条是保活凭据（小时级），下条是扫码 30 天授权窗口。
+       两条曲线衰减速度差两个数量级，分开画才能同时看清「保活是否在跑」和「是否该重扫」。 */
+    .account-lifecycle {
+      grid-column: 1 / -1; min-width: 0; display: grid; gap: 7px;
+      padding-top: 9px; margin-top: 1px; border-top: 1px dashed var(--line);
+    }
+    .lifecycle-row {
+      display: grid; grid-template-columns: 58px minmax(40px, 1fr) 84px;
+      align-items: center; gap: 8px;
+      color: var(--muted); font-size: 12px; line-height: 1.3;
+    }
+    .lifecycle-label { white-space: nowrap; }
+    .lifecycle-track { height: 4px; overflow: hidden; border-radius: 999px; background: var(--surface-strong); }
+    .lifecycle-track span {
+      display: block; height: 100%; border-radius: inherit;
+      background: var(--lifecycle-color, var(--success));
+      transition: width 180ms ease, background-color 180ms ease;
+    }
+    .lifecycle-value {
+      min-width: 72px; text-align: right; color: var(--faint); white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .lifecycle-row.warn .lifecycle-value { color: var(--warning); }
+    .lifecycle-row.expired .lifecycle-value { color: var(--danger); }
+    .lifecycle-note { color: var(--faint); font-size: 11px; }
+    .lifecycle-inactive { color: var(--muted); font-size: 12px; min-height: 64px; align-content: center; }
+    .lifecycle-rescan {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 1px 7px; border-radius: 999px; font-size: 11px;
+      border: 1px solid var(--warning-soft); background: var(--warning-soft); color: var(--warning);
+      justify-self: start;
+    }
+
     /* ---- account detail tooltip ---- */
     .account-tooltip {
       position: fixed; z-index: 100; pointer-events: none;
@@ -230,6 +263,9 @@
       .search-input { width: 100%; }
       .search-input:focus { width: 100%; }
       .account-strip { grid-auto-columns: minmax(222px, 86vw); }
+      /* 窄屏下把时长列压窄，保证两条进度条仍有足够长度可读 */
+      .lifecycle-row { grid-template-columns: 52px minmax(32px, 1fr) 74px; gap: 6px; }
+      .account-lifecycle { gap: 6px; }
     }
 
   </style>
@@ -252,6 +288,7 @@
         <button class="btn ghost" id="themeToggle" title="切换主题" aria-label="切换深色/浅色模式">🌓</button>
         <button class="btn secondary" id="changePwdBtn" title="修改登录密码">🔑</button>
         <button class="btn secondary" id="logoutBtn" title="退出登录">退出</button>
+        <a class="btn secondary" href="/proxies">代理设置</a>
         <a class="btn secondary" href="/docs/index.html">Swagger</a>
         <a class="btn primary" href="/scan">➕ 扫码添加</a>
       </div>
@@ -591,6 +628,55 @@
       return { text, level: left <= CREDENTIAL_SOON_SECONDS ? "soon" : "" };
     }
 
+    // 把秒数折成「X天Y小时」这类中文时长，用于扫码窗口与凭据剩余展示。
+    function lifecycleDuration(seconds) {
+      if (!Number.isFinite(seconds)) return "未记录";
+      if (seconds <= 0) return "已到期";
+      if (seconds < 60) return "不足1分钟";
+      const days = Math.floor(seconds / 86400);
+      const hours = Math.floor((seconds % 86400) / 3600);
+      if (days > 0) return `${days}天${hours}小时`;
+      const minutes = Math.floor((seconds % 3600) / 60);
+      if (hours > 0) return `${hours}小时${minutes}分钟`;
+      return `${minutes}分钟`;
+    }
+
+    // 进度条颜色随剩余比例连续过渡：归零为红，过半转黄，充裕为绿。
+    function lifecycleColor(ratio) {
+      const value = Math.max(0, Math.min(1, Number(ratio) || 0));
+      const hue = 8 + value * 112;
+      return `hsl(${Math.round(hue)} 78% 42%)`;
+    }
+
+    // 账号生命周期双进度条。
+    // 保活凭据只有两小时量级，扫码窗口是 30 天；两者混在一个数字里会互相淹没，
+    // 所以拆成两行独立衰减，并在 25 天处提示需要重新扫码。
+    function lifecycleMarkup(account) {
+      if (account.status === "expired") {
+        return '<span class="account-lifecycle lifecycle-inactive">保活已停止 · 重新扫码后恢复</span>';
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const observed = Number(account.refresh_token_observed_at || 0);
+      const scanWindow = 30 * 86400;
+      const scanRemaining = observed ? Math.max(0, scanWindow - (now - observed)) : 0;
+      const scanRatio = observed ? Math.min(100, Math.max(0, scanRemaining / scanWindow * 100)) : 0;
+      const expiresAt = Number(account.credential_expires_at || 0);
+      const expiresIn = Number(account.credential_expires_in || 7200);
+      const autoRemaining = expiresAt ? Math.max(0, expiresAt - now) : 0;
+      const autoRatio = expiresAt ? Math.min(100, Math.max(0, autoRemaining / expiresIn * 100)) : 0;
+      const scanClass = !observed || scanRemaining <= 0 ? "expired" : scanRemaining < 5 * 86400 ? "warn" : "";
+      const autoClass = !expiresAt || autoRemaining <= 0 ? "expired" : autoRemaining < 15 * 60 ? "warn" : "";
+      const rescanHint = account.rescan_recommended
+        ? '<span class="lifecycle-rescan">⚠ 建议重新扫码</span>'
+        : "";
+      return `<span class="account-lifecycle" aria-label="账号有效期">
+        <span class="lifecycle-row ${autoClass}"><span class="lifecycle-label">保活凭据</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(autoRatio / 100)};width:${autoRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${expiresAt ? lifecycleDuration(autoRemaining) : "未记录"}</span></span>
+        <span class="lifecycle-row ${scanClass}"><span class="lifecycle-label">扫码 30天</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(scanRatio / 100)};width:${scanRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${observed ? lifecycleDuration(scanRemaining) : "未记录"}</span></span>
+        <span class="lifecycle-note">${observed ? `扫码于 ${formatChecked(observed)}` : "扫码时间未记录"}${expiresAt ? ` · 凭据到期 ${formatChecked(expiresAt)}` : ""}</span>
+        ${rescanHint}
+      </span>`;
+    }
+
     function renderAccounts() {
       const strip = $("accountStrip");
       const query = ($("searchInput").value || "").trim().toLowerCase();
@@ -632,10 +718,6 @@
           <span class="account-main">
             <span class="account-name">${escapeHTML(name)}${account.remark ? `<span class="account-remark">${escapeHTML(account.remark)}</span>` : ""}</span>
             <span class="account-status ${cls}"><span class="status-dot"></span>${statusText(account.status)}</span>
-            ${(() => {
-              const cred = credentialText(account);
-              return cred ? `<span class="credential-chip ${cred.level}">⏱ ${escapeHTML(cred.text)}</span>` : "";
-            })()}
             <span class="account-meta">
               <span>ID: ${escapeHTML(String(account.id ?? "-"))}</span>
               <span>uin: ${escapeHTML(account.uin ?? "-")}</span>
@@ -646,8 +728,10 @@
           <span class="account-card-actions">
             <button class="btn ghost remark-account-btn" data-openid="${escapeHTML(account.openid)}" data-remark="${escapeHTML(account.remark || "")}" title="设置备注" aria-label="设置 ${escapeHTML(name)} 的备注">✎</button>
             <button class="btn ghost status-account-btn" data-openid="${escapeHTML(account.openid)}" data-status="${escapeHTML(account.status || "")}" data-name="${escapeHTML(name)}" title="手动修正状态" aria-label="修正 ${escapeHTML(name)} 的状态">⇄</button>
+            <button class="btn ghost proxy-account-btn" data-id="${escapeHTML(String(account.id ?? ""))}" data-openid="${escapeHTML(account.openid)}" title="管理代理" aria-label="管理 ${escapeHTML(name)} 的代理">🌐</button>
             <button class="btn ghost danger delete-account-btn" data-openid="${escapeHTML(account.openid)}" data-name="${escapeHTML(name)}" title="删除账号" aria-label="删除 ${escapeHTML(name)}">🗑</button>
-          </span>`;
+          </span>
+          ${lifecycleMarkup(account)}`;
 
         // hover tooltip — show all account details (fixed + body-mounted to avoid overflow clipping)
         const tooltip = document.createElement("div");
@@ -662,6 +746,13 @@
           ["设备 MAC", account.device_id || "—"],
           ["状态", statusText(account.status)],
           ["凭据到期", credentialText(account) ? credentialText(account).text : "—"],
+          ["扫码时间", account.refresh_token_observed_at ? formatTime(account.refresh_token_observed_at) : "未记录"],
+          ["扫码窗口剩余", (() => {
+            const observed = Number(account.refresh_token_observed_at || 0);
+            if (!observed) return "未记录";
+            return lifecycleDuration(Math.max(0, 30 * 86400 - (Math.floor(Date.now() / 1000) - observed)));
+          })()],
+          ["重新扫码", account.rescan_recommended ? "建议尽快重扫" : "暂不需要"],
           ["最后检测", formatTime(account.last_checked_at)],
           ["创建时间", formatTime(account.created_at)],
           ["更新时间", formatTime(account.updated_at)],
@@ -717,9 +808,17 @@
           if (e.target.closest(".delete-account-btn")) return;
           if (e.target.closest(".remark-account-btn")) return;
           if (e.target.closest(".status-account-btn")) return;
+          if (e.target.closest(".proxy-account-btn")) return;
           state.selectedOpenID = account.openid;
           syncSelectedAccount();
           setActivity(`已选择：${name}`);
+        });
+
+        // 跳转到该账号的代理设置页
+        button.querySelector(".proxy-account-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
+          const ref = e.currentTarget.dataset.id || e.currentTarget.dataset.openid || "";
+          location.href = `/proxies?ref=${encodeURIComponent(ref)}`;
         });
 
         // 手动修正账号状态

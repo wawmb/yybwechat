@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,7 +51,12 @@ type Config struct {
 	AdminPassword   string        // 预设管理员口令（可选，需与 AdminUser 同时提供）
 
 	// ---- 协议接口保护 ----
-	ProtocolToken string // /wxapp/* 的 Bearer 令牌，留空表示不校验
+	ProtocolToken string // /wxapp/* 与 GET /accounts 的 Bearer 令牌，留空表示不校验
+
+	// TrustProxy 表示是否信任反向代理传来的 X-Forwarded-For / X-Real-IP。
+	// 默认关闭：直连场景下这些头可以任意伪造，用来绕过登录失败限流、
+	// 或把会话的登录 IP 写成别人的地址。只有确实部署在可信代理后面才应打开。
+	TrustProxy bool
 
 	// ---- 凭据保活 ----
 	KeepAliveInterval time.Duration // 保活扫描间隔（0 禁用）
@@ -68,6 +74,7 @@ type App struct {
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session // 活跃的二维码会话
+	qrClients  map[string]*qr.Client  // 会话 ID → 该会话使用的客户端（可能绑定了账号代理）
 
 	loginLimit loginLimiter // 登录失败限流表
 
@@ -77,9 +84,26 @@ type App struct {
 	stopKeep     chan struct{} // 通知后台保活 goroutine 退出
 	healthClient *http.Client  // Webhook 推送专用的 HTTP 客户端
 
+	// notifyRetryMu 让补推流程串行执行。健康检查与保活是两个独立的 ticker，
+	// 同一秒内可能同时进入补推，导致同一条告警重复推送两次。
+	notifyRetryMu sync.Mutex
+
 	keepAliveMu    sync.Mutex          // 保护保活重退避状态表
 	keepAliveNext  map[int64]time.Time // 账号 ID → 下次可重试时间（失败退避）
 	keepAliveFails map[int64]int       // 账号 ID → 连续失败次数（用于递增退避）
+
+	// ---- 代理运行时状态 ----
+	// 动态代理的出口 IP 是短效的，用一份带 TTL 的租约缓存避免高频提取；
+	// 同一账号的提取过程串行化，防止并发打出多个出口。
+	proxyMu           sync.Mutex
+	proxyLeases       map[int64]accountProxyLease // 账号 ID → 当前代理租约
+	proxyLeaseLocks   map[int64]chan struct{}     // 账号 ID → 提取串行锁
+	proxyLeaseLocksMu sync.Mutex                  // 保护 proxyLeaseLocks
+
+	// refreshLocks 让同一账号的凭据刷新串行执行，
+	// 避免保活与健康检查同时刷新导致凭据互相覆盖。
+	refreshLocksMu sync.Mutex
+	refreshLocks   map[int64]chan struct{}
 }
 
 // swaggerDocsHandler 是 Swagger UI 的 HTTP 处理器。
@@ -147,11 +171,15 @@ func NewApp(cfg Config) (*App, error) {
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
+		qrClients:  map[string]*qr.Client{},
 		healthClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
-		keepAliveNext:  map[int64]time.Time{},
-		keepAliveFails: map[int64]int{},
+		keepAliveNext:   map[int64]time.Time{},
+		keepAliveFails:  map[int64]int{},
+		proxyLeases:     map[int64]accountProxyLease{},
+		proxyLeaseLocks: map[int64]chan struct{}{},
+		refreshLocks:    map[int64]chan struct{}{},
 	}
 
 	// 打开独立的认证数据库。与主库分离，避免影响业务表结构。
@@ -252,23 +280,25 @@ func (a *App) Handler() http.Handler {
 	open.Any("/api/auth/login", gin.WrapF(a.handleAuthLogin))
 	open.Any("/api/auth/logout", gin.WrapF(a.handleAuthLogout))
 	open.Any("/api/auth/me", gin.WrapF(a.handleAuthMe))
-	open.Any("/api/auth/password", gin.WrapF(a.handleAuthPassword))
 	open.Any("/openapi.json", gin.WrapF(a.handleOpenAPI))
-	// GET /accounts 免认证且不需要任何令牌：自动化脚本（青龙面板定时任务等）
-	// 第一步就是用它探测服务并拉取账号列表，要求脚本先做交互式登录或配置静态令牌
-	// 都会直接打断无人值守的调用链。
-	// 放开的只是只读：返回 AccountPublic，剔除了 login_buffer 与 credentials。
-	// DELETE 等写操作在 handleAccountsRoot 内部二次鉴权，仍然要求管理员登录。
-	open.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
 
 	// ---- 2. 协议组（可选令牌门禁）----
-	// 统一使用 /wxapp/* 命名空间，不另开平行的兼容别名路径。
+	// 统一使用 /wxapp/* 命名空间，/wx/oauth 仅作为旧版自动化脚本的兼容别名保留。
 	proto := router.Group("/", a.protocolTokenGate())
 	proto.Any("/wxapp/getCode", gin.WrapF(a.handleGetCode))
 	proto.Any("/wxapp/getPhoneNumber", gin.WrapF(a.handleGetPhoneNumber))
 	proto.Any("/wxapp/operateWxData", gin.WrapF(a.handleOperateWXData))
 	proto.Any("/wxapp/getUserInfo", gin.WrapF(a.handleGetUserInfo))
 	proto.Any("/wxapp/oauth", gin.WrapF(a.handleOAuth))
+	// /wx/oauth 是早期脚本使用的路径。转发到同一个处理器，
+	// 因此两者的响应格式、校验规则完全一致，不会出现「同一个能力两种行为」。
+	proto.Any("/wx/oauth", gin.WrapF(a.handleOAuth))
+	// GET /accounts 免登录但受协议令牌保护：自动化脚本（青龙面板定时任务等）
+	// 第一步就是用它探测服务并拉取账号列表，要求脚本先做交互式登录会直接打断
+	// 无人值守的调用链，因此这里只要求可选的 Bearer 令牌（未配置时直接放行）。
+	// 返回 AccountPublic，剔除了 login_buffer 与 credentials。
+	// DELETE 等写操作在 handleAccountsRoot 内部二次鉴权，仍然要求管理员登录。
+	proto.Any("/accounts", gin.WrapF(a.handleAccountsRoot))
 
 	// ---- 3. 管理组（需登录）----
 	secure := router.Group("/", a.requireBrowserSession())
@@ -290,6 +320,21 @@ func (a *App) Handler() http.Handler {
 	secure.Any("/settings/webhook", gin.WrapF(a.handleSettingsWebhook))
 	secure.Any("/settings/webhook/test", gin.WrapF(a.handleWebhookTest))
 	secure.Any("/api/version", gin.WrapF(a.handleVersion))
+	// 修改口令必须挂在需要登录的分组下：处理器依赖中间件把当前管理员写进
+	// context，注册到公开组会让 currentUser 永远取到空值，接口恒返回 401。
+	secure.Any("/api/auth/password", gin.WrapF(a.handleAuthPassword))
+
+	// ---- 4. 代理管理（需登录）----
+	// 账号级代理：读写、连通性测试
+	secure.Any("/accounts/proxy", gin.WrapF(a.handleAccountProxy))
+	secure.Any("/accounts/proxy/test", gin.WrapF(a.handleAccountProxyTest))
+	// 供应商配置与地区列表
+	secure.Any("/api/proxy-profiles", gin.WrapF(a.handleProxyProfiles))
+	secure.Any("/api/proxy-profiles/*path", gin.WrapF(a.handleProxyProfiles))
+	// 按运营者位置推荐地区
+	secure.Any("/api/proxy-location/recommend", gin.WrapF(a.handleProxyLocationRecommend))
+	// 代理设置页
+	secure.Any("/proxies", gin.WrapF(a.handleProxiesPage))
 
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c.Writer, http.StatusNotFound, "not found")
@@ -301,19 +346,30 @@ func (a *App) Handler() http.Handler {
 // protocolTokenGate 是协议接口的可选 Bearer 令牌门禁。
 // 未配置 ProtocolToken 时直接放行（保持内网自托管的易用性）；
 // 配置后要求请求携带 Authorization: Bearer <token>，使用常量时间比较防时序攻击。
+//
+// 已登录的管理员会话同样放行：控制台页面本身就要调 /accounts 和 /wxapp/*
+// （账号列表、调用面板），而浏览器只会带会话 Cookie，不可能自己加协议令牌。
+// 如果这里只认令牌，配了 --protocol-token 之后控制台会全部 401，
+// 而前端把 401 当成「会话过期」直接踢回登录页——等于开着令牌就没法用控制台。
 func (a *App) protocolTokenGate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if a.cfg.ProtocolToken == "" {
 			c.Next()
 			return
 		}
+		// 先试令牌：脚本调用占多数，这一步不需要查库
 		token := bearerToken(c.Request)
-		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.ProtocolToken)) != 1 {
-			writeError(c.Writer, http.StatusUnauthorized, "invalid or missing protocol token")
-			c.Abort()
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.ProtocolToken)) == 1 {
+			c.Next()
 			return
 		}
-		c.Next()
+		// 再退回到管理员会话，供浏览器端使用
+		if a.isAuthenticated(c.Request) {
+			c.Next()
+			return
+		}
+		writeError(c.Writer, http.StatusUnauthorized, "invalid or missing protocol token")
+		c.Abort()
 	}
 }
 
@@ -365,6 +421,15 @@ func (a *App) handleScan(w http.ResponseWriter, r *http.Request) {
 	serveFileOrText(w, r, filepath.Join(a.resources.Templates, "scan.html"), fallbackScanHTML)
 }
 
+// handleProxiesPage 处理代理设置页请求，返回供应商与账号代理的配置界面。
+func (a *App) handleProxiesPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	serveFileOrText(w, r, filepath.Join(a.resources.Templates, "proxies.html"), fallbackProxiesHTML)
+}
+
 // handleDocs 处理 Swagger API 文档页面请求。
 func (a *App) handleDocs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -400,18 +465,26 @@ func (a *App) handleQRRoot(w http.ResponseWriter, r *http.Request) {
 	a.pruneQR()
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.RequestTimeout+35*time.Second)
 	defer cancel()
-	img, err := a.qr.GetQRCodeImage(ctx)
+	// 带上 ref 时为已有账号重新扫码：沿用该账号的代理出口，
+	// 避免「用 A 地 IP 登录、之后用 B 地 IP 保活」导致微信侧风控。
+	client := a.qrClientForScan(ctx, r.URL.Query().Get("ref"))
+	img, err := client.GetQRCodeImage(ctx)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	a.mu.Lock()
 	a.qrSessions[img.Session.ID] = img.Session
+	a.qrClients[img.Session.ID] = client
 	keep := make(map[string]bool, len(a.qrSessions))
 	for sid := range a.qrSessions {
 		keep[sid] = true
 	}
 	a.mu.Unlock()
+	if !isSafeFileToken(img.Session.ID) {
+		writeError(w, http.StatusBadGateway, "二维码会话标识异常，已拒绝写入")
+		return
+	}
 	path := a.resources.qrPath(img.Session.ID)
 	_ = os.WriteFile(path, img.ImageBytes, 0o644)
 	a.cleanupQR(keep)
@@ -467,7 +540,7 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "qr session not found")
 			return
 		}
-		result, err := a.qr.PollQRCode(r.Context(), sess)
+		result, err := a.getQRClient(sessionID).PollQRCode(r.Context(), sess)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
@@ -483,14 +556,16 @@ func (a *App) handleQR(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "qr session not found")
 			return
 		}
+		// 扫码与后续的换票、取资料必须用同一个客户端（同一条代理出口）
+		client := a.getQRClient(sessionID)
 		// 微信授权已完成但 login buffer 可能尚未就绪，短窗口内重试吸收这段竞态
-		result, err := getLoginBufferWithRetry(r.Context(), a.qr, sess)
+		result, err := getLoginBufferWithRetry(r.Context(), client, sess)
 		if err != nil {
 			writeError(w, http.StatusConflict, "buffer not ready: "+err.Error())
 			return
 		}
 		var userInfo map[string]any
-		if ui, err := a.qr.LoginBuffers().FetchUserInfo(r.Context(), result.Credentials); err == nil {
+		if ui, err := client.LoginBuffers().FetchUserInfo(r.Context(), result.Credentials); err == nil {
 			userInfo = ui
 		}
 		acc, err := a.storeFromScan(r.Context(), result.LoginBuffer, result.Credentials, userInfo)
@@ -792,7 +867,7 @@ type wxappRequest struct {
 	Payload map[string]any `json:"payload"`
 }
 
-type wxappCall func(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any) (map[string]any, error)
+type wxappCall func(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error)
 
 func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload bool, call wxappCall) {
 	var body wxappRequest
@@ -920,53 +995,19 @@ func (a *App) serveAvatar(w http.ResponseWriter, r *http.Request, acc *store.Wec
 }
 
 // storeFromScan 将扫码登录结果保存为新的微信账号记录。
+//
+// 这里用 ToMapForScan 而不是 ToMap：扫码是 30 天授权窗口的起点，
+// 只有扫码这一刻才该写入 refresh_token_observed_at。
 func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds protocol.LoginBufferCredentials, userInfo map[string]any) (*store.WechatAccount, error) {
 	openid := creds.OpenID
 	nick := pickNickname(userInfo, creds.Nickname)
 	avatar := a.resolveAvatar(ctx, openid, userInfo)
 	status := "alive"
-	return a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMap(), &status)
+	return a.db.UpsertAccount(ctx, openid, loginBuffer, stringPtrMaybe(nick), stringPtrMaybe(nick), stringPtrMaybe(avatar), userInfo, creds.ToMapForScan(), &status)
 }
 
-// refreshLiveness 刷新单个账号的存活状态。
-//
-// 返回 status ("alive"、"expired" 或 "unknown")、新的 LoginBuffer
-// (仅 status=="alive" 时非空)，以及刷新过程中的错误。
-//
-// 状态判定规则（与 definitiveCredentialFailure 配合）：
-//   - "alive"   ：刷新成功；
-//   - "expired" ：刷新失败，且错误明确表明凭据已彻底失效，必须重新扫码；
-//   - "unknown" ：刷新失败但属于网络抖动、超时等瞬时错误。此时保留原状态与 MMTLS
-//     会话等待下一轮重试，避免把一次抖动误判成掉线并推送告警。
-//
-// 注意：只有 "expired" 会清理 MMTLS 会话；"unknown" 不清理，因为旧会话可能仍然可用。
-func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) (status string, newLoginBuffer string, err error) {
-	if acc.Credentials == nil {
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
-		return "unknown", "", errors.New("account has no credentials")
-	}
-	creds := protocol.CredentialsFromMap(acc.Credentials)
-	result, refreshErr := a.qr.RefreshLoginBuffer(ctx, creds)
-	if refreshErr != nil {
-		if definitiveCredentialFailure(refreshErr) {
-			_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-			// 凭据已彻底失效，清理会话，避免后续请求继续复用过期会话
-			a.invalidateAccountSessions(ctx, acc.ID)
-			return "expired", "", refreshErr
-		}
-		// 瞬时错误：不改写为 expired，也不清理会话，等待下一轮重试自然恢复
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
-		return "unknown", "", refreshErr
-	}
-	_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
-	// 凭据已更新，旧 MMTLS 会话不再有效，必须清理以触发重新登录
-	a.invalidateAccountSessions(ctx, acc.ID)
-	_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
-	if avatar := a.resolveAvatar(ctx, acc.OpenID, acc.UserInfo); avatar != "" {
-		_ = a.db.SetAccountProfile(ctx, acc.ID, acc.Nickname, &avatar, acc.UserInfo)
-	}
-	return "alive", result.LoginBuffer, nil
-}
+// refreshLiveness 的实现已迁移到 keepalive.go：刷新、状态判定与 Webhook 通知
+// 统一收敛到 refreshAccount 一处，避免不同调用路径的通知行为不一致。
 
 // resyncProfile 重新同步账号的个人资料信息。
 func (a *App) resyncProfile(ctx context.Context, acc *store.WechatAccount) (*store.WechatAccount, error) {
@@ -990,36 +1031,74 @@ type accountExpiredError struct{ openid string }
 func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
 
 // invokeWXApp 通过 MMTLS 协议连接调用 wxapp 接口，自动处理会话失效重试。
+//
+// 关键点：只有「明确的凭据失效」才允许把账号判死；纯网络/代理故障只丢弃会话缓存，
+// 否则一次代理抖动就会把所有账号刷成 expired，并触发一轮误报告警。
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
-	proxy := a.cfg.TCPProxy
-	if _, err := a.db.GetSession(ctx, acc.ID, proxy); err == nil {
-		result, err := call(ctx, acc, appID, payload)
-		if err == nil {
-			return result, nil
-		}
-		_ = a.db.InvalidateSession(ctx, acc.ID, proxy)
-	}
-	status, newBuffer, _ := a.refreshLiveness(ctx, acc)
-	if status != "alive" {
+	// 把排队、协议登录和凭据补救都算进同一份预算，避免层层超时叠加到客户端放弃之后
+	ctx, cancel := context.WithTimeout(ctx, a.cfg.RequestTimeout+35*time.Second)
+	defer cancel()
+	if accountStatus(acc) == "expired" {
+		// 脚本打到失效账号上时顺手告警：这条调用链本来就会被跳过，
+		// 不借它发声，就可能只剩日志里一行错误
+		a.alertExpired(acc)
 		return nil, accountExpiredError{openid: acc.OpenID}
 	}
-	// 直接使用刷新后的 LoginBuffer，避免因 GetAccount 失败而使用过期凭据
-	if newBuffer != "" {
-		acc.LoginBuffer = newBuffer
+	if accountNeedsRescan(acc) {
+		return nil, accountExpiredError{openid: acc.OpenID}
 	}
-	return call(ctx, acc, appID, payload)
+	proxyValue, fallbackDirect, err := a.resolveWXAppProxy(ctx, acc.ID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve account proxy: %w", err)
+	}
+	result, callErr := call(ctx, acc, appID, payload, proxyValue, fallbackDirect)
+	if callErr == nil {
+		return result, nil
+	}
+	var networkErr net.Error
+	if ctx.Err() != nil || errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded) ||
+		errors.As(callErr, &networkErr) || errors.Is(callErr, io.EOF) || errors.Is(callErr, io.ErrUnexpectedEOF) {
+		// 传输层失败不能证明凭据过期：保留会话与原始诊断信息，也不重放这条慢调用
+		return nil, callErr
+	}
+	_ = a.db.InvalidateSession(ctx, acc.ID, proxyValue)
+	// 凭据补救始终走账号自己的刷新通道，即使本次协议调用显式选择了直连
+	status, _, refreshErr := a.refreshAccount(ctx, acc, true)
+	if status != "alive" {
+		if status == "expired" {
+			return nil, accountExpiredError{openid: acc.OpenID}
+		}
+		return nil, fmt.Errorf("refresh account credentials: %w", refreshErr)
+	}
+	if refreshErr != nil {
+		return nil, fmt.Errorf("refresh account credentials: %w", refreshErr)
+	}
+	if fresh, getErr := a.db.GetAccount(ctx, acc.ID); getErr == nil && fresh != nil {
+		acc = fresh
+	}
+	return call(ctx, acc, appID, payload, proxyValue, fallbackDirect)
 }
 
-func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+// accountNeedsRescan 覆盖「刷新结论不明、但缓存凭据已经过期」的账号。
+// 这类账号不能继续被每次脚本调用拖进协议层重试，必须先重新扫码。
+func accountNeedsRescan(acc *store.WechatAccount) bool {
+	if acc == nil || accountStatus(acc) != "unknown" || acc.Credentials == nil {
+		return false
+	}
+	expiresAt := protocol.CredentialsFromMap(acc.Credentials).ExpiresAt
+	return expiresAt > 0 && expiresAt <= time.Now().Unix()
 }
 
-func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
+	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, proxyValue, fallbackDirect)
 }
 
-func (a *App) invokeOperateWXData(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any) (map[string]any, error) {
-	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, a.cfg.TCPProxy)
+func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
+	return a.pool.GetPhoneNumber(ctx, acc.LoginBuffer, appID, acc.ID, proxyValue, fallbackDirect)
+}
+
+func (a *App) invokeOperateWXData(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, proxyValue string, fallbackDirect bool) (map[string]any, error) {
+	return a.pool.OperateWXData(ctx, acc.LoginBuffer, appID, payload, acc.ID, proxyValue, fallbackDirect)
 }
 
 // ---- Webhook 推送辅助 ----
@@ -1029,7 +1108,67 @@ func isWeworkWebhook(url string) bool {
 	return strings.Contains(url, "qyapi.weixin.qq.com/cgi-bin/webhook/send")
 }
 
-// buildWeworkPayload 构建企业微信 markdown_v2 消息格式的推送内容。
+// buildWeworkRenewalPayload 构造「凭据已过期且续不上」的企业微信卡片。
+//
+// 与状态变更卡片刻意区分：这张卡在说「账号现在用不了了」，但状态可能仍留在
+// 待确认并继续重试，所以不能写成「已失效，请重扫」——那会把网络问题误导成账号问题。
+func buildWeworkRenewalPayload(acc *store.WechatAccount, status, reason string) []byte {
+	nick := deref(acc.Nickname)
+	if nick == "" {
+		nick = acc.OpenID
+	}
+	advice := "检查代理与网络连通性；若持续失败且刷新被微信侧拒绝，请重新扫码。"
+	content := fmt.Sprintf(
+		"## ⚠️ 账号无法续期\n"+
+			"> 账号: <font color=\"comment\">%s</font>\n"+
+			"> OpenID: <font color=\"comment\">%s</font>\n"+
+			"> 当前状态: <font color=\"warning\">%s</font>\n"+
+			"> 原因: <font color=\"warning\">%s</font>\n"+
+			"> 时间: <font color=\"comment\">%s</font>\n"+
+			"> 建议: <font color=\"comment\">%s</font>\n",
+		nick, acc.OpenID, status, reason,
+		time.Now().Format("2006-01-02 15:04:05"), advice,
+	)
+
+	wrapper := map[string]any{
+		"msgtype": "markdown_v2",
+		"markdown_v2": map[string]string{
+			"content": content,
+		},
+	}
+	body, _ := json.Marshal(wrapper)
+	return body
+}
+
+// buildWeworkExpiredPayload 构造「账号已失效，必须重新扫码」的卡片。
+//
+// 与状态变更卡片（alive → expired）不同：这张卡的语义是「它现在仍然是失效的」，
+// 用于周期性的重提醒。它不依赖状态跃迁，因此不存在「跃迁没被捕捉到就永远沉默」的问题。
+func buildWeworkExpiredPayload(acc *store.WechatAccount) []byte {
+	nick := deref(acc.Nickname)
+	if nick == "" {
+		nick = acc.OpenID
+	}
+	content := fmt.Sprintf(
+		"## ❌ 账号已失效，需重新扫码\n"+
+			"> 账号: <font color=\"comment\">%s</font>\n"+
+			"> OpenID: <font color=\"comment\">%s</font>\n"+
+			"> 当前状态: <font color=\"warning\">expired</font>\n"+
+			"> 时间: <font color=\"comment\">%s</font>\n"+
+			"> 说明: <font color=\"comment\">凭据已彻底失效，自动保活已停止；重新扫码后恢复。</font>\n",
+		nick, acc.OpenID, time.Now().Format("2006-01-02 15:04:05"),
+	)
+
+	wrapper := map[string]any{
+		"msgtype": "markdown_v2",
+		"markdown_v2": map[string]string{
+			"content": content,
+		},
+	}
+	body, _ := json.Marshal(wrapper)
+	return body
+}
+
 func buildWeworkPayload(event, oldStatus, newStatus string, acc *store.WechatAccount) []byte {
 	nick := deref(acc.Nickname)
 	if nick == "" {
@@ -1041,7 +1180,6 @@ func buildWeworkPayload(event, oldStatus, newStatus string, acc *store.WechatAcc
 	} else if newStatus == "expired" {
 		emoji = "❌"
 	}
-
 	content := fmt.Sprintf(
 		"## %s 账号状态变更\n"+
 			"> 账号: <font color=\"comment\">%s</font>\n"+
@@ -1115,8 +1253,13 @@ func (a *App) runHealthChecker() {
 	}
 }
 
-// scanAndCheck 扫描所有账号，对超时未检查的账号执行刷新，并在状态变更时推送 Webhook。
+// scanAndCheck 扫描所有账号，对超时未检查的账号执行刷新。
+// 状态变更的 Webhook 通知由 refreshAccount 内部统一处理，这里不再重复推送。
 func (a *App) scanAndCheck() {
+	// 先把上一轮没送达的通知补推掉：账号一旦被判为 expired 就不会再被扫描，
+	// 漏掉这一次就再没有机会补上。
+	a.retryPendingNotifications(context.Background())
+
 	accounts, err := a.db.ListAccounts(context.Background())
 	if err != nil {
 		log.Printf("[health] 获取账号列表失败: %v", err)
@@ -1140,7 +1283,9 @@ func (a *App) scanAndCheck() {
 		}
 		// 与凭据保活保持一致：一旦判定为 expired，凭据已彻底失效，只能靠用户重新扫码。
 		// 这里如果不跳过，健康检查会在 stale 窗口过期后反复尝试刷新一个救不回来的账号。
-		if deref(acc.Status) == "expired" {
+		if accountStatus(acc) == "expired" {
+			// 跳过刷新不等于跳过告警：只要还挂着 expired，就按重提醒窗口持续推送
+			a.alertExpired(acc)
 			continue
 		}
 		lastChecked := int64(0)
@@ -1151,18 +1296,11 @@ func (a *App) scanAndCheck() {
 			continue
 		}
 
-		oldStatus := deref(acc.Status)
-		newStatus, _, refreshErr := a.refreshLiveness(context.Background(), acc)
-
+		status, _, refreshErr := a.refreshAccount(context.Background(), acc, true)
 		if refreshErr != nil {
-			// 瞬时错误会归为 unknown 并等待重试，这里只记录原因，不推送告警
-			log.Printf("[health] 账号 %s (%s) 刷新失败: %v",
-				deref(acc.Nickname), acc.OpenID, refreshErr)
-		}
-		if shouldNotifyStatusChange(oldStatus, newStatus) {
-			log.Printf("[health] 账号 %s (%s) 状态变更: %s → %s",
-				deref(acc.Nickname), acc.OpenID, oldStatus, newStatus)
-			a.notifyWebhook(acc, oldStatus, newStatus)
+			// 瞬时错误会归为 unknown 并等待重试，这里只记录原因
+			log.Printf("[health] 账号 %s (%s) 刷新失败（状态 %s）: %v",
+				deref(acc.Nickname), acc.OpenID, status, refreshErr)
 		}
 	}
 
@@ -1187,10 +1325,13 @@ func shouldNotifyStatusChange(oldStatus, newStatus string) bool {
 
 // notifyWebhook 向已配置的 Webhook 地址 POST 账号状态变更通知。
 // 自动检测企业微信 Webhook 地址并适配消息格式。
-func (a *App) notifyWebhook(acc *store.WechatAccount, oldStatus, newStatus string) {
+//
+// 返回值表示这次推送是否真正送达。调用方据此决定要不要把该状态记为「已通知」：
+// 失败时不记，下一轮扫描会重新推送，避免一次网络抖动把掉线告警永久吞掉。
+func (a *App) notifyWebhook(acc *store.WechatAccount, oldStatus, newStatus string) bool {
 	url := a.getWebhookURL()
 	if url == "" {
-		return
+		return false
 	}
 
 	var body []byte
@@ -1211,21 +1352,56 @@ func (a *App) notifyWebhook(acc *store.WechatAccount, oldStatus, newStatus strin
 		}
 		body, _ = json.Marshal(payload)
 	}
+	return a.postWebhook(url, body, deref(acc.Nickname))
+}
 
+// notifyWebhookRenewal 推送「凭据已过期且续不上」的告警。
+//
+// 与状态变更通知分开，是因为它的语义不同：账号此刻确实不可用了，
+// 但还留在 unknown 继续重试（网络或代理恢复后能自愈），不能写成终态误导运营者去重扫。
+func (a *App) notifyWebhookRenewal(acc *store.WechatAccount, status, reason string) bool {
+	url := a.getWebhookURL()
+	if url == "" {
+		return false
+	}
+
+	var body []byte
+	if isWeworkWebhook(url) {
+		body = buildWeworkRenewalPayload(acc, status, reason)
+	} else {
+		payload := map[string]any{
+			"event":     "renewal_failed",
+			"timestamp": time.Now().Unix(),
+			"account": map[string]any{
+				"id":       acc.ID,
+				"openid":   acc.OpenID,
+				"uin":      acc.UIN,
+				"nickname": acc.Nickname,
+			},
+			"current": status,
+			"reason":  reason,
+		}
+		body, _ = json.Marshal(payload)
+	}
+	return a.postWebhook(url, body, deref(acc.Nickname))
+}
+
+// postWebhook 是通知发送的唯一实现，返回是否送达。
+func (a *App) postWebhook(url string, body []byte, nickname string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[webhook] 创建请求失败: %v", err)
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
 	resp, err := a.healthClient.Do(req)
 	if err != nil {
-		log.Printf("[webhook] 推送失败 (%s): %v", url, err)
-		return
+		log.Printf("[webhook] 推送失败 (%s): %v", sanitizeURL(url), err)
+		return false
 	}
 	defer resp.Body.Close()
 
@@ -1240,18 +1416,86 @@ func (a *App) notifyWebhook(acc *store.WechatAccount, oldStatus, newStatus strin
 					msg, _ := parsed["errmsg"].(string)
 					ok = false
 					log.Printf("[webhook] 推送被拒绝 (%s): errcode=%d errmsg=%s，HTTP %d",
-						deref(acc.Nickname), int64(c), msg, resp.StatusCode)
+						nickname, int64(c), msg, resp.StatusCode)
 				}
 			}
 		}
 	}
 
 	if ok {
-		log.Printf("[webhook] 推送成功 (%s): %s → %s, HTTP %d",
-			deref(acc.Nickname), oldStatus, newStatus, resp.StatusCode)
+		log.Printf("[webhook] 推送成功 (%s), HTTP %d", nickname, resp.StatusCode)
 	} else {
 		log.Printf("[webhook] 推送返回异常 (%s): HTTP %d, body=%s",
-			url, resp.StatusCode, string(respBody))
+			sanitizeURL(url), resp.StatusCode, string(respBody))
+	}
+	return ok
+}
+
+// notifyWebhookExpired 推送「账号已失效」告警，返回是否送达。
+//
+// 事件名与状态变更区分开（`account_expired`），让接收方能判断这是「刚失效」
+// 还是「仍然失效」——后者是周期性重提醒，不是新的状态跃迁。
+func (a *App) notifyWebhookExpired(acc *store.WechatAccount) bool {
+	url := a.getWebhookURL()
+	if url == "" {
+		return false
+	}
+	var body []byte
+	if isWeworkWebhook(url) {
+		body = buildWeworkExpiredPayload(acc)
+	} else {
+		payload := map[string]any{
+			"event":     "account_expired",
+			"timestamp": time.Now().Unix(),
+			"account": map[string]any{
+				"id":       acc.ID,
+				"openid":   acc.OpenID,
+				"uin":      acc.UIN,
+				"nickname": acc.Nickname,
+			},
+			"current": "expired",
+		}
+		body, _ = json.Marshal(payload)
+	}
+	return a.postWebhook(url, body, deref(acc.Nickname))
+}
+
+// retryPendingNotifications 补推上一轮未能送达的状态变更。
+//
+// 背景：账号一旦被判为 expired，保活与健康检查都会跳过它（终态，救不回来）。
+// 如果那次推送恰好失败，状态已经落库、后续再没有任何路径会重算它，
+// 告警就永久丢失了。这里每轮扫描比对 status 与 status_notified，
+// 把「已收敛但没送达」的变更重新推一次，送达后立即记账，因此不会重复打扰。
+func (a *App) retryPendingNotifications(ctx context.Context) {
+	if a.getWebhookURL() == "" {
+		return
+	}
+	// 健康检查与保活是两条独立的定时器，不加锁时同一秒内可能并发补推同一条记录
+	a.notifyRetryMu.Lock()
+	defer a.notifyRetryMu.Unlock()
+
+	pending, err := a.db.ListPendingNotifications(ctx)
+	if err != nil {
+		log.Printf("[notify] 读取待补推列表失败: %v", err)
+		return
+	}
+	for _, item := range pending {
+		acc := &store.WechatAccount{ID: item.AccountID, OpenID: item.OpenID, Nickname: item.Nickname, UIN: item.UIN}
+		log.Printf("[notify] 补推账号 %s (%s) 的状态变更: %q → %s",
+			deref(item.Nickname), item.OpenID, item.NotifiedStatus, item.Status)
+		if !a.notifyWebhook(acc, item.NotifiedStatus, item.Status) {
+			continue
+		}
+		if err := a.db.MarkStatusNotified(ctx, item.AccountID, item.Status); err != nil {
+			log.Printf("[notify] 记录补推结果失败 (账号 %d): %v", item.AccountID, err)
+		}
+		// 与 alertExpired 共用同一记账列：这一条已经把「账号失效」送到人了，
+		// 本轮再走失效告警时会被重提醒窗口拦住，不会连发两条同义消息。
+		if item.Status == "expired" {
+			if err := a.db.MarkExpiryAlerted(ctx, item.AccountID, time.Now().Unix()); err != nil {
+				log.Printf("[notify] 记录失效告警时间失败 (账号 %d): %v", item.AccountID, err)
+			}
+		}
 	}
 }
 
@@ -1333,10 +1577,45 @@ func (a *App) getQRSession(id string) *qr.Session {
 	return a.qrSessions[id]
 }
 
+// getQRClient 返回该扫码会话使用的客户端；找不到时退回全局直连客户端。
+func (a *App) getQRClient(id string) *qr.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if client := a.qrClients[id]; client != nil {
+		return client
+	}
+	return a.qr
+}
+
+// qrClientForScan 根据账号 ref 选出扫码应使用的客户端。
+//
+// ref 为空（全新扫码）或账号未配置代理时使用全局直连客户端；
+// 代理解析失败同样退回直连，保证扫码入口不会因代理不可用而整体失效。
+func (a *App) qrClientForScan(ctx context.Context, ref string) *qr.Client {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return a.qr
+	}
+	acc, err := a.db.ResolveAccount(ctx, ref)
+	if err != nil {
+		return a.qr
+	}
+	proxyValue, fallbackDirect, err := a.resolveAccountProxy(ctx, acc.ID)
+	if err != nil || proxyValue == "" {
+		return a.qr
+	}
+	client, err := qr.NewClientWithProxy(a.cfg.RequestTimeout, proxyValue, fallbackDirect)
+	if err != nil {
+		return a.qr
+	}
+	return client
+}
+
 // dropQRSession 删除二维码会话并清理对应的图片文件。
 func (a *App) dropQRSession(id string) {
 	a.mu.Lock()
 	delete(a.qrSessions, id)
+	delete(a.qrClients, id)
 	a.mu.Unlock()
 	_ = os.Remove(a.resources.qrPath(id))
 }
@@ -1352,6 +1631,7 @@ func (a *App) pruneQR() {
 	}
 	for _, sid := range drop {
 		delete(a.qrSessions, sid)
+		delete(a.qrClients, sid)
 	}
 	a.mu.Unlock()
 	for _, sid := range drop {

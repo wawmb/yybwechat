@@ -45,10 +45,11 @@ const (
 	callbackURL  = "https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth"
 	qrBase       = "https://open.weixin.qq.com/connect/qrcode/"
 	longPollBase = "https://long.open.weixin.qq.com/connect/l/qrconnect"
+	qrPollWait   = 35 * time.Second
+	// qrPollLimit 是长轮询客户端的超时上限。微信在未扫码时最长挂起到约 35 秒，
+	// 客户端超时必须大于这个值，否则每次轮询都会被本地提前掐断。
+	qrPollLimit = 40 * time.Second
 )
-
-// 轮询长连接的超时时间。微信在未扫码时会挂起连接直到超时，属正常现象。
-const qrPollWait = 35 * time.Second
 
 // 正则表达式：分别用于提取二维码 UUID、微信错误码和授权码
 var (
@@ -93,15 +94,31 @@ type PollResult struct {
 // Client 是微信扫码登录客户端，封装了创建会话、获取二维码和轮询等操作。
 type Client struct {
 	timeout      time.Duration
+	transport    http.RoundTripper
 	loginBuffers *protocol.LoginBufferClient
 }
 
-// NewClient 创建一个新的二维码客户端。
+// NewClient 创建一个走直连的二维码客户端。
 func NewClient(timeout time.Duration) *Client {
+	client, _ := NewClientWithProxy(timeout, "", false)
+	return client
+}
+
+// NewClientWithProxy 创建一个绑定指定代理的二维码客户端。
+//
+// proxyValue 为空表示直连；fallbackDirect 为真时，代理握手失败会自动降级直连，
+// 避免单个代理节点故障让扫码流程整体不可用。
+func NewClientWithProxy(timeout time.Duration, proxyValue string, fallbackDirect bool) (*Client, error) {
+	transport, err := protocol.NewHTTPTransport(proxyValue, fallbackDirect)
+	if err != nil {
+		return nil, err
+	}
+	httpClient := &http.Client{Timeout: timeout, Transport: transport}
 	return &Client{
 		timeout:      timeout,
-		loginBuffers: protocol.NewLoginBufferClient(timeout),
-	}
+		transport:    transport,
+		loginBuffers: protocol.NewLoginBufferClientWithHTTPClient(httpClient, timeout),
+	}, nil
 }
 
 // LoginBuffers 返回 LoginBufferClient 实例，用于获取和刷新 login_buffer。
@@ -131,7 +148,7 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Timeout: c.timeout, Jar: jar}
+	hc := &http.Client{Timeout: c.timeout, Jar: jar, Transport: c.transport}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oauthURL, nil)
 	if err != nil {
 		return nil, err
@@ -177,7 +194,16 @@ func (c *Client) FetchQRCodeImage(ctx context.Context, sess *Session) ([]byte, e
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("QR image HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	// 校验返回内容确实是图片。代理或网络拦截时微信会返回 HTML/JSON，
+	// 若不校验会把脏数据当成二维码展示，用户看到的是一张坏图却无从判断原因。
+	if err := validateQRCodeImage(data); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // PollQRCode 轮询微信长连接端点，获取当前扫码状态。
@@ -202,11 +228,18 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 		return PollResult{}, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := sess.HTTPClient.Do(req)
+	// 长轮询必须使用比常规短连接更长的客户端超时。微信在用户未扫码时会把请求挂起
+	// 到 35 秒左右，若沿用 RequestTimeout（默认 8 秒）会先被本地掐断，导致扫码页反复报错。
+	pollClient := *sess.HTTPClient
+	if pollClient.Timeout == 0 || pollClient.Timeout < qrPollLimit {
+		pollClient.Timeout = qrPollLimit
+	}
+	resp, err := pollClient.Do(req)
 	if err != nil {
 		// 长轮询超时是预期行为：用户还没扫码时微信会一直挂起连接。
 		// 降级为 pending 而不是报错，前端可继续轮询，避免扫码页面无故中断。
-		if errors.Is(err, context.DeadlineExceeded) {
+		// 只有外层 ctx 被取消（用户离开页面）时才如实返回错误。
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 			sess.Status = "pending"
 			return PollResult{Status: "pending"}, nil
 		}
@@ -281,6 +314,27 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 	sess.LoginBuffer = lb
 	sess.Status = "confirmed"
 	return protocol.LoginBufferResult{LoginBuffer: lb, Credentials: creds}, nil
+}
+
+// GetLoginBufferFromCode 直接用已有的微信授权 code 换取 login_buffer，
+// 跳过扫码轮询环节。用于需要由外部服务回传 code 的场景。
+func (c *Client) GetLoginBufferFromCode(ctx context.Context, code string) (protocol.LoginBufferResult, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return protocol.LoginBufferResult{}, fmt.Errorf("authorize code is empty")
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return protocol.LoginBufferResult{}, err
+	}
+	sess := &Session{
+		HTTPClient:    &http.Client{Timeout: c.timeout, Jar: jar, Transport: c.transport},
+		Jar:           jar,
+		AuthorizeCode: code,
+		Status:        "authorized",
+		CreatedAt:     time.Now(),
+	}
+	return c.GetLoginBuffer(ctx, sess)
 }
 
 // RefreshLoginBuffer 刷新登录凭证并获取新的 login_buffer。

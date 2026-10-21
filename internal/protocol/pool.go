@@ -49,6 +49,9 @@ type WmpfSession struct {
 	ShortlinkTargets []Target
 	CreatedAt        time.Time
 	TCPProxy         string
+	// FallbackDirect 记录建立该会话时是否允许代理失败后降级直连。
+	// 必须随会话一起持久化，否则换代理后短连接的重试策略会和登录时不一致。
+	FallbackDirect bool
 }
 
 // Pool 是协议连接池，管理 MMTLS 会话的创建、缓存和复用。
@@ -57,8 +60,14 @@ type Pool struct {
 	cfg Config
 	db  *store.DB
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	mu sync.Mutex
+	// locks 是按「账号 + 代理」维度的会话建立串行锁。
+	// 用 channel 而不是 sync.Mutex，是为了让排队阶段也能被 ctx 取消，
+	// 避免一次卡死的登录把后续请求全部拖到超时之后。
+	locks map[string]*keyLock
+	// codeLocks 让同一账号的 wx.login 串行执行。
+	// 一次性 code 在并发消费时会互相作废，不同账号之间仍然可以并行。
+	codeLocks map[int64]*keyLock
 
 	loginSem     chan struct{}
 	shortlinkSem chan struct{}
@@ -88,15 +97,27 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	return &Pool{
 		cfg:          cfg,
 		db:           db,
-		locks:        map[string]*sync.Mutex{},
+		locks:        map[string]*keyLock{},
+		codeLocks:    map[int64]*keyLock{},
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
 	}
 }
 
 // GetCode 通过 MMTLS 短连接获取小程序的登录 code。
-func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+//
+// wx.login 返回空 code 通常意味着会话已失效，这里会重建会话并重试一次；
+// 其他操作（如云函数调用）可能有副作用，不做自动重放。
+func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool) (map[string]any, error) {
+	codeUnlock, err := acquireScoped(ctx, &p.mu, p.codeLocks, accountID, func() *keyLock {
+		return &keyLock{ch: make(chan struct{}, 1)}
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer codeUnlock()
+
+	call := func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		sessDevice, err := p.ensureSessDevice(ctx, accountID)
 		if err != nil {
 			return nil, err
@@ -115,12 +136,46 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 			return nil, err
 		}
 		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
+	}
+	return retryLoginCode(ctx, func() (map[string]any, error) {
+		return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call)
+	}, func() error {
+		if err := p.Invalidate(ctx, accountID, tcpProxy); err != nil {
+			return err
+		}
+		if tcpProxy != "" && fallbackDirect {
+			return p.Invalidate(ctx, accountID, "")
+		}
+		return nil
 	})
 }
 
+// retryLoginCode 在拿到空 code 或短连接载荷异常时重建会话并重试一次。
+func retryLoginCode(ctx context.Context, call func() (map[string]any, error), invalidate func() error) (map[string]any, error) {
+	result, err := call()
+	emptyCode := err == nil && (result == nil || result["code"] == nil || result["code"] == "")
+	if !emptyCode && !errors.Is(err, ErrShortlinkPayload) {
+		return result, err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if resetErr := invalidate(); resetErr != nil {
+		return nil, fmt.Errorf("reset code session: %w", resetErr)
+	}
+	result, err = call()
+	if err != nil {
+		return nil, fmt.Errorf("code retry after session rebuild failed: %w", err)
+	}
+	if result == nil || result["code"] == nil || result["code"] == "" {
+		return nil, fmt.Errorf("wx.login returned empty code after session rebuild")
+	}
+	return result, nil
+}
+
 // GetPhoneNumber 通过 MMTLS 短连接获取用户手机号。
-func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool) (map[string]any, error) {
+	return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		sessDevice, err := p.ensureSessDevice(ctx, accountID)
 		if err != nil {
 			return nil, err
@@ -139,8 +194,8 @@ func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, ac
 }
 
 // OperateWXData 通过 MMTLS 短连接代理小程序云函数调用。
-func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, payload map[string]any, accountID int64, tcpProxy string) (map[string]any, error) {
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, payload map[string]any, accountID int64, tcpProxy string, fallbackDirect bool) (map[string]any, error) {
+	return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		sessDevice, err := p.ensureSessDevice(ctx, accountID)
 		if err != nil {
 			return nil, err
@@ -161,9 +216,11 @@ func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, pay
 	})
 }
 
+// Invalidate 删除指定账号在指定代理下的会话。
+// 代理地址由调用方解析完成后传入，这里不再回退到全局配置，
+// 避免「账号级代理」与「全局代理」两条来源相互覆盖。
 func (p *Pool) Invalidate(ctx context.Context, accountID int64, tcpProxy string) error {
-	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
-	return p.db.InvalidateSession(ctx, accountID, effective)
+	return p.db.InvalidateSession(ctx, accountID, tcpProxy)
 }
 
 // ensureSessDevice 返回指定账号的稳定设备标识（MAC 字节序列）。
@@ -176,18 +233,19 @@ func (p *Pool) ensureSessDevice(ctx context.Context, accountID int64) ([]byte, e
 	return []byte(mac), nil
 }
 
-func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, op func(context.Context, WmpfSession) (map[string]any, error)) (map[string]any, error) {
-	effective := effectiveProxy(tcpProxy, p.cfg.TCPProxy)
-	st, err := p.state(ctx, loginBuffer, accountID, effective)
+func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, fallbackDirect bool, op func(context.Context, WmpfSession) (map[string]any, error)) (map[string]any, error) {
+	st, err := p.state(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect)
 	if err == nil {
+		st.FallbackDirect = fallbackDirect
 		res, err := op(ctx, st)
-		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect {
+		if err == nil || tcpProxy == "" || !fallbackDirect {
 			return res, err
 		}
-		_ = p.Invalidate(ctx, accountID, effective)
+		// 代理链路失败，丢掉该代理下的会话后改走直连重试一次
+		_ = p.Invalidate(ctx, accountID, tcpProxy)
 	}
-	if effective != "" && p.cfg.TCPProxyFallbackDirect {
-		st, err = p.state(ctx, loginBuffer, accountID, "")
+	if tcpProxy != "" && fallbackDirect {
+		st, err = p.state(ctx, loginBuffer, accountID, "", false)
 		if err != nil {
 			return nil, err
 		}
@@ -196,15 +254,23 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	return nil, err
 }
 
-func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string) (WmpfSession, error) {
+func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, tcpProxy string, fallbackDirect bool) (WmpfSession, error) {
+	// 排队等待也要计入登录预算，而不是只算 socket 阶段
+	ctx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
+	defer cancel()
 	if row, err := p.db.GetSession(ctx, accountID, tcpProxy); err == nil {
 		return sessionFromBlob(row.SessionBlob)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return WmpfSession{}, err
 	}
-	lock := p.lockFor(fmt.Sprintf("%d\x00%s", accountID, tcpProxy))
-	lock.Lock()
-	defer lock.Unlock()
+	lockKey := fmt.Sprintf("%d\x00%s", accountID, tcpProxy)
+	unlock, err := acquireScoped(ctx, &p.mu, p.locks, lockKey, func() *keyLock {
+		return &keyLock{ch: make(chan struct{}, 1)}
+	})
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	defer unlock()
 	if row, err := p.db.GetSession(ctx, accountID, tcpProxy); err == nil {
 		return sessionFromBlob(row.SessionBlob)
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -218,9 +284,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 		return WmpfSession{}, err
 	}
 	defer release(p.loginSem)
-	loginCtx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
-	defer cancel()
-	st, err := p.loginAndSession(loginCtx, loginBuffer, tcpProxy)
+	st, err := p.loginAndSession(ctx, loginBuffer, tcpProxy, fallbackDirect)
 	if err != nil {
 		return WmpfSession{}, err
 	}
@@ -234,18 +298,55 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	return st, nil
 }
 
-func (p *Pool) lockFor(key string) *sync.Mutex {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if l := p.locks[key]; l != nil {
-		return l
-	}
-	l := &sync.Mutex{}
-	p.locks[key] = l
-	return l
+// keyLock 是按 key 复用的串行锁。
+//
+// 表里的条目必须能被回收：动态代理每次提取都会换出口，key 里带着代理地址，
+// 只增不删的话长期运行会攒出成千上万条再也用不到的记录。
+// refs 记录当前有多少调用方持有这条锁，归零时由 dropScoped 摘除表项。
+type keyLock struct {
+	ch   chan struct{}
+	refs int
 }
 
-func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string) (WmpfSession, error) {
+// acquireScoped 取得 key 对应的串行锁，返回解锁函数。
+//
+// 与 acquire/release 的区别在于它带引用计数并负责回收表项：
+// 拿到锁之前先 +1，释放之后 -1，归零时把条目从表里删掉。
+// 排队阶段同样可被 ctx 取消，取消时也会归还引用，不会留下泄漏的计数。
+func acquireScoped[K comparable](ctx context.Context, mu *sync.Mutex, table map[K]*keyLock, key K, makeLock func() *keyLock) (func(), error) {
+	mu.Lock()
+	entry := table[key]
+	if entry == nil {
+		entry = makeLock()
+		table[key] = entry
+	}
+	entry.refs++
+	mu.Unlock()
+
+	select {
+	case entry.ch <- struct{}{}:
+	case <-ctx.Done():
+		dropScoped(mu, table, key, entry)
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-entry.ch
+		dropScoped(mu, table, key, entry)
+	}, nil
+}
+
+// dropScoped 归还一次引用，归零时删除表项。
+// 删除前确认表里仍是同一条记录，避免误删并发场景下后来新建的锁。
+func dropScoped[K comparable](mu *sync.Mutex, table map[K]*keyLock, key K, entry *keyLock) {
+	mu.Lock()
+	entry.refs--
+	if entry.refs <= 0 && table[key] == entry {
+		delete(table, key)
+	}
+	mu.Unlock()
+}
+
+func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string, fallbackDirect bool) (WmpfSession, error) {
 	if loginBuffer == "" {
 		return WmpfSession{}, fmt.Errorf("login_buffer is empty")
 	}
@@ -256,7 +357,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	targets = orderLonglinkTargets(targets, 6)
 	var last error
 	for _, t := range targets {
-		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
+		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, fallbackDirect)
 		if err != nil {
 			last = err
 			continue
@@ -270,6 +371,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 		shortTargets := getShortlinkTargets(ctx, p.cfg.ShortlinkTimeout, p.cfg.DNSCacheTTL)
 		st.ShortlinkTargets = shortTargets
 		st.TCPProxy = tcpProxy
+		st.FallbackDirect = fallbackDirect
 		st.CreatedAt = time.Now()
 		return st, nil
 	}
@@ -335,11 +437,9 @@ func (p *Pool) sendEnvelope(ctx context.Context, st WmpfSession, envelope []byte
 	defer release(p.shortlinkSem)
 	reqCtx, cancel := context.WithTimeout(ctx, p.cfg.ShortlinkTimeout)
 	defer cancel()
-	fallback := p.cfg.TCPProxyFallbackDirect
-	if st.TCPProxy != "" {
-		fallback = false
-	}
-	return send0RTT(reqCtx, st.ShortlinkTargets, st.PSK, st.Session.RecvKey, envelope, p.cfg.ShortlinkTimeout, st.TCPProxy, fallback)
+	// 是否允许代理失败后降级直连，随会话一起记录，
+	// 保证短连接与建立会话时的策略一致。
+	return send0RTT(reqCtx, st.ShortlinkTargets, st.PSK, st.Session.RecvKey, envelope, p.cfg.ShortlinkTimeout, st.TCPProxy, st.FallbackDirect)
 }
 
 func acquire(ctx context.Context, sem chan struct{}) error {
@@ -356,13 +456,6 @@ func release(sem chan struct{}) {
 	case <-sem:
 	default:
 	}
-}
-
-func effectiveProxy(req, def string) string {
-	if req != "" {
-		return req
-	}
-	return def
 }
 
 func sessionExpiresAt(st WmpfSession, ttl time.Duration) int64 {
@@ -389,6 +482,7 @@ func (st WmpfSession) toBlob() map[string]any {
 		"psk_entry":         st.PSK,
 		"shortlink_targets": targetsToAny(st.ShortlinkTargets),
 		"tcp_proxy":         st.TCPProxy,
+		"fallback_direct":   st.FallbackDirect,
 	}
 }
 
@@ -420,6 +514,7 @@ func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
 		},
 		ShortlinkTargets: targetsFromAny(blob["shortlink_targets"]),
 		TCPProxy:         stringAny(blob["tcp_proxy"]),
+		FallbackDirect:   blob["fallback_direct"] == true,
 		CreatedAt:        time.Now(),
 	}
 	if len(st.ShortlinkTargets) == 0 {

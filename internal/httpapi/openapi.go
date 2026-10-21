@@ -17,6 +17,7 @@ func newOpenAPISpec() map[string]any {
 			{"name": "health", "description": "服务健康检查"},
 			{"name": "qr", "description": "微信扫码登录"},
 			{"name": "accounts", "description": "已保存的微信账号"},
+			{"name": "proxy", "description": "账号代理与代理供应商配置"},
 			{"name": "wxapp", "description": "wxapp 业务接口调用"},
 			{"name": "settings", "description": "系统设置"},
 			{"name": "auth", "description": "管理员认证与会话"},
@@ -83,7 +84,7 @@ func newOpenAPISpec() map[string]any {
 			"/accounts": map[string]any{
 				"get": openAPIOperation(
 					[]string{"accounts"},
-					"获取账号列表（公开只读，免认证且无需令牌，供自动化脚本探测服务与挑选在线账号）。返回脱敏视图 AccountPublic，不含 login_buffer 与 credentials",
+					"获取账号列表（免登录，受可选的协议令牌保护：配置了 protocol-token 后需带 Authorization: Bearer。供自动化脚本探测服务与挑选在线账号）。返回脱敏视图 AccountPublic，不含 login_buffer 与 credentials",
 					nil,
 					nil,
 					defaulted(map[string]any{
@@ -229,6 +230,19 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			// /wx/oauth 是早期自动化脚本使用的路径，与 /wxapp/oauth 共用同一处理器，
+			// 响应格式完全一致，保留在此是为了让老脚本能被文档描述到。
+			"/wx/oauth": map[string]any{
+				"post": openAPIOperation(
+					[]string{"wxapp"},
+					"/wxapp/oauth 的兼容别名，行为与响应完全一致",
+					nil,
+					jsonRequestBody(refSchema("OAuthRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("授权链接。", refSchema("OAuthResponse")),
+					}),
+				),
+			},
 			"/accounts/remark": map[string]any{
 				"post": openAPIOperation(
 					[]string{"accounts"},
@@ -270,6 +284,112 @@ func newOpenAPISpec() map[string]any {
 					jsonRequestBody(refSchema("AccountConfirmRequest")),
 					defaulted(map[string]any{
 						"200": jsonResponse("预览信息或重排映射。", freeFormObjectSchema("confirm=false 返回 current_ids 与 gaps；confirm=true 返回 changed 与 mapping。")),
+					}),
+				),
+			},
+			"/accounts/proxy": map[string]any{
+				"get": openAPIOperation(
+					[]string{"proxy"},
+					"读取指定账号的代理配置（含有效性与保活兼容性提示）",
+					[]map[string]any{
+						queryStringParam("ref", "账号 ID 或 OpenID。", true),
+					},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("账号代理配置。", freeFormObjectSchema("包含 mode、proxy_type、region_* 、token_ttl_minutes、keepalive_supported 与 proxy_warning 等字段。")),
+					}),
+				),
+				"put": openAPIOperation(
+					[]string{"proxy"},
+					"保存账号代理配置，并作废该账号已缓存的 MMTLS 会话",
+					nil,
+					jsonRequestBody(freeFormObjectSchema("mode 为 direct/static/api；引用配置库时提供 provider_profile_id 与地区编码。")),
+					defaulted(map[string]any{
+						"200": jsonResponse("保存后的账号代理配置。", freeFormObjectSchema("与 GET 返回结构一致。")),
+					}),
+				),
+			},
+			"/accounts/proxy/test": map[string]any{
+				"post": openAPIOperation(
+					[]string{"proxy"},
+					"立即提取一次代理并探测出口 IP 与归属地，用于保存前验证",
+					nil,
+					jsonRequestBody(freeFormObjectSchema("与保存接口相同的字段；只传 ref 表示测试该账号已保存的配置。")),
+					defaulted(map[string]any{
+						"200": jsonResponse("解析结果与实际出口信息。", freeFormObjectSchema("包含 resolved、proxy（脱敏入口节点）、exit_ip、exit_region、exit_city 与 probe_error。")),
+					}),
+				),
+			},
+			"/api/proxy-profiles": map[string]any{
+				"get": openAPIOperation(
+					[]string{"proxy"},
+					"列出全部代理供应商配置",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("供应商配置列表。", arraySchema(freeFormObjectSchema("包含 id、name、provider、proxy_type 与 api_url。"))),
+					}),
+				),
+				"post": openAPIOperation(
+					[]string{"proxy"},
+					"新增代理供应商配置（品赞提取链接 / 巨量业务编号 / 静态代理地址）",
+					nil,
+					jsonRequestBody(freeFormObjectSchema("provider 为 ipzan/juliang/static；巨量需提供 trade_no 与 api_key。")),
+					defaulted(map[string]any{
+						"201": jsonResponse("创建后的配置。", freeFormObjectSchema("包含 id、name、provider、proxy_type 与规范化后的 api_url。")),
+					}),
+				),
+			},
+			"/api/proxy-profiles/{id}": map[string]any{
+				"put": openAPIOperation(
+					[]string{"proxy"},
+					"更新指定代理供应商配置",
+					[]map[string]any{pathStringParam("id", "配置 ID。")},
+					jsonRequestBody(freeFormObjectSchema("字段与新增接口一致。")),
+					defaulted(map[string]any{
+						"200": jsonResponse("更新后的配置。", freeFormObjectSchema("包含 id、name、provider、proxy_type 与 api_url。")),
+					}),
+				),
+				"delete": openAPIOperation(
+					[]string{"proxy"},
+					"删除指定代理供应商配置，引用它的账号会退回直连",
+					[]map[string]any{pathStringParam("id", "配置 ID。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("删除结果。", freeFormObjectSchema("包含 deleted 字段。")),
+					}),
+				),
+			},
+			"/api/proxy-profiles/areas/provinces": map[string]any{
+				"get": openAPIOperation(
+					[]string{"proxy"},
+					"列出品赞支持的省份地区编码",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("省份列表。", arraySchema(freeFormObjectSchema("包含 6 位地区编码 code 与名称 name。"))),
+					}),
+				),
+			},
+			"/api/proxy-profiles/areas/cities": map[string]any{
+				"get": openAPIOperation(
+					[]string{"proxy"},
+					"列出指定省份下的城市地区编码",
+					[]map[string]any{queryStringParam("province", "6 位省份地区编码。", true)},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("城市列表。", arraySchema(freeFormObjectSchema("包含 6 位地区编码 code 与名称 name。"))),
+					}),
+				),
+			},
+			"/api/proxy-location/recommend": map[string]any{
+				"post": openAPIOperation(
+					[]string{"proxy"},
+					"按浏览器上报的经纬度（缺省时退回 IP 归属地）推荐代理省市编码",
+					nil,
+					jsonOptionalRequestBody(freeFormObjectSchema("可选 latitude 与 longitude。")),
+					defaulted(map[string]any{
+						"200": jsonResponse("定位与匹配结果。", freeFormObjectSchema("包含 province、city、source、ip、province_code、city_code 与 matched。")),
 					}),
 				),
 			},
@@ -395,6 +515,20 @@ func newOpenAPISpec() map[string]any {
 						"format":      "int64",
 						"description": "凭据到期时间戳（Unix 秒）。0 表示无法判断。不含 token 本身，仅用于展示剩余有效期。",
 					},
+					"credential_expires_in": map[string]any{
+						"type":        "integer",
+						"format":      "int64",
+						"description": "本次凭据发放时的有效期秒数，作为剩余比例的分母。",
+					},
+					"refresh_token_observed_at": map[string]any{
+						"type":        "integer",
+						"format":      "int64",
+						"description": "refresh token 首次被观察到的时间戳（Unix 秒），用于推算 30 天扫码授权窗口。仅在扫码成功那一刻写入。",
+					},
+					"rescan_recommended": map[string]any{
+						"type":        "boolean",
+						"description": "扫码窗口已进入最后 5 天时置为 true，提示重新扫码。",
+					},
 					"created_at": int64Schema(),
 					"updated_at": int64Schema(),
 				}),
@@ -444,19 +578,29 @@ func newOpenAPISpec() map[string]any {
 					"http_status": map[string]any{"type": "integer", "description": "目标服务器返回的 HTTP 状态码。"},
 				}),
 				"OAuthRequest": objectSchema([]string{"app_id", "redirect_uri"}, map[string]any{
-					"ref":             nullableStringSchema("可选，账号引用，仅做存在性校验。"),
+					"ref":             nullableStringSchema("可选，账号引用，仅做存在性校验；传入时响应会回填 account_id 与 openid。"),
 					"app_id":          map[string]any{"type": "string", "description": "公众号 AppID，18 位且以 wx 开头。"},
+					"appid":           nullableStringSchema("app_id 的旧字段名，两者等价，同时传入时以 app_id 为准。"),
 					"redirect_uri":    map[string]any{"type": "string", "description": "授权回调地址，必须是绝对 http/https URL。"},
 					"scope":           nullableStringSchema("snsapi_base（静默）或 snsapi_userinfo（弹窗），默认 snsapi_base。"),
 					"state":           nullableStringSchema("可选回传状态，留空自动生成随机值。"),
 					"component_appid": nullableStringSchema("可选，第三方平台 AppID。"),
 				}),
 				"OAuthResponse": objectSchema([]string{"url", "full_url"}, map[string]any{
-					"url":       map[string]any{"type": "string", "description": "授权链接。"},
-					"full_url":  map[string]any{"type": "string", "description": "追加 #wechat_redirect 后的完整链接。"},
-					"scope":     map[string]any{"type": "string"},
-					"state":     map[string]any{"type": "string"},
-					"authorize": map[string]any{"type": "string", "description": "授权方式说明。"},
+					"url":                    map[string]any{"type": "string", "description": "授权链接。"},
+					"full_url":               map[string]any{"type": "string", "description": "追加 #wechat_redirect 后的完整链接。"},
+					"scope":                  map[string]any{"type": "string"},
+					"state":                  map[string]any{"type": "string"},
+					"appid":                  map[string]any{"type": "string", "description": "本次使用的公众号 AppID。"},
+					"account_id":             map[string]any{"type": "integer", "description": "传入 ref 时回填的账号 ID，未传为 0。"},
+					"openid":                 map[string]any{"type": "string", "description": "传入 ref 时回填的 openid，未传为空串。"},
+					"code":                   map[string]any{"type": "null", "description": "恒为 null：本接口只生成链接，code 由微信回调携带。"},
+					"authorization_required": map[string]any{"type": "boolean", "description": "恒为 true，提示本步必须由用户在微信内完成授权。"},
+					"callback_code_source":   map[string]any{"type": "string", "description": "code 的来源，固定为 redirect_uri。"},
+					"mode":                   map[string]any{"type": "string", "description": "固定为 authorization_url。"},
+					"next_step":              map[string]any{"type": "string", "description": "下一步该做什么的自然语言说明。"},
+					"callback_params":        arraySchema(map[string]any{"type": "string"}),
+					"authorize":              map[string]any{"type": "string", "description": "授权方式说明（兼容字段）。"},
 				}),
 				"AccountRemarkRequest": objectSchema([]string{"ref"}, map[string]any{
 					"ref":    map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},

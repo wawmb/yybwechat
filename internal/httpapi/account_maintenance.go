@@ -187,7 +187,7 @@ func (a *App) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	oldStatus := deref(acc.Status)
+	oldStatus := accountStatus(acc)
 	if err := a.db.SetAccountStatus(r.Context(), acc.ID, body.Status); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -202,7 +202,16 @@ func (a *App) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	if shouldNotifyStatusChange(oldStatus, body.Status) {
 		log.Printf("[maintenance] 账号 %s (%s) 状态被手动调整: %s → %s",
 			deref(acc.Nickname), acc.OpenID, oldStatus, body.Status)
-		a.notifyWebhook(acc, oldStatus, body.Status)
+		// 手动调整也要走「送达才记账」的规则：推送失败时留给后台补推，
+		// 否则运营者以为已经通知过了，实际一条都没发出去。
+		if a.notifyWebhook(acc, oldStatus, body.Status) {
+			if err := a.db.MarkStatusNotified(r.Context(), acc.ID, body.Status); err != nil {
+				log.Printf("[maintenance] 记录推送状态失败 (账号 %d): %v", acc.ID, err)
+			}
+		}
+	} else if err := a.db.MarkStatusNotified(r.Context(), acc.ID, body.Status); err != nil {
+		// 无需通知的调整（如状态未变化）直接对齐标记，避免被后台误判成待补推
+		log.Printf("[maintenance] 记录状态失败 (账号 %d): %v", acc.ID, err)
 	}
 	updated, err := a.db.GetAccount(r.Context(), acc.ID)
 	if err != nil {

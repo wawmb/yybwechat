@@ -107,6 +107,8 @@ func main() {
 		"/wxapp/* 的 Bearer 令牌，留空表示不校验")
 	cookieSecure := flag.Bool("cookie-secure", envBool("YYB_COOKIE_SECURE", false),
 		"为会话 Cookie 加 Secure 标记（HTTPS 部署时开启）")
+	trustProxy := flag.Bool("trust-proxy", envBool("YYB_TRUST_PROXY", false),
+		"信任反向代理传来的 X-Forwarded-For/X-Real-IP（仅部署在可信代理后面时开启）")
 	flag.Parse()
 
 	// 管理员可通过环境变量预设，避免首次启动必须人工访问 /setup
@@ -131,6 +133,7 @@ func main() {
 		SessionDuration:   time.Duration(*sessionHours) * time.Hour,
 		CookieSecure:      *cookieSecure,
 		ProtocolToken:     *protocolToken,
+		TrustProxy:        *trustProxy,
 		AdminUser:         adminUser,
 		AdminPassword:     adminPassword,
 	}
@@ -154,7 +157,10 @@ func main() {
 	go func() {
 		log.Printf("yybwechat 服务已启动，监听 http://%s", addr)
 		if cfg.ProtocolToken == "" {
-			log.Printf("[security] 未配置 YYB_PROTOCOL_TOKEN，/wxapp/* 接口不做令牌校验，请勿直接暴露到公网")
+			log.Printf("[security] 未配置 YYB_PROTOCOL_TOKEN，/accounts 与 /wxapp/* 不做令牌校验，请勿直接暴露到公网")
+			if *host != "127.0.0.1" && *host != "localhost" && *host != "::1" {
+				log.Printf("[security] 当前监听 %s，建议改为 --host 127.0.0.1 由反向代理转发，或设置 --protocol-token", *host)
+			}
 		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("服务器异常退出: %v", err)

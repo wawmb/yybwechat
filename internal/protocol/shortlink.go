@@ -7,14 +7,18 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 )
 
 var (
-	type8Prefix = []byte{0x00, 0x00, 0x00, 0x10, 0x08, 0x00, 0x00, 0x00, 0x0b, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x12}
-	earlyAlert  = []byte{0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x01}
+	// ErrShortlinkPayload 表示收到的 AppData 无法解密或解析。
+	// 单独定义成哨兵错误，便于上层区分「网络/代理故障」与「报文不合法」。
+	ErrShortlinkPayload = errors.New("AppData decrypt/parse failed")
+	type8Prefix         = []byte{0x00, 0x00, 0x00, 0x10, 0x08, 0x00, 0x00, 0x00, 0x0b, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x12}
+	earlyAlert          = []byte{0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x01}
 )
 
 func build0RTTRequest(entry pskEntry, envelope []byte) ([]byte, []byte, []byte, []byte, error) {
@@ -161,5 +165,5 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 			}
 		}
 	}
-	return nil, nil, fmt.Errorf("AppData decrypt/parse failed")
+	return nil, nil, ErrShortlinkPayload
 }

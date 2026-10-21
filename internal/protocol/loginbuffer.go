@@ -6,12 +6,37 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"time"
 )
+
+// ErrMissingRefreshToken 表示账号凭据里没有 refresh token，无法续期，只能重新扫码。
+var ErrMissingRefreshToken = errors.New("missing refresh token")
+
+// RefreshRejectedError 表示刷新凭据接口返回了业务拒绝码（code != 0）。
+// 与网络错误、代理错误、JSON 解析错误区分开，供失效判定精确识别微信侧的真实拒绝。
+type RefreshRejectedError struct {
+	Code    int
+	Message string
+}
+
+func (e *RefreshRejectedError) Error() string {
+	return fmt.Sprintf("refresh failed: code=%d msg=%s", e.Code, e.Message)
+}
+
+// LoginBufferRejectedError 表示 login_buffer 接口返回了业务拒绝码（code != 0）。
+type LoginBufferRejectedError struct {
+	Code    int
+	Message string
+}
+
+func (e *LoginBufferRejectedError) Error() string {
+	return fmt.Sprintf("login_buffer failed: code=%d msg=%s", e.Code, e.Message)
+}
 
 // 应用宝登录凭证相关的 URL 和认证密钥常量
 const (
@@ -24,38 +49,67 @@ const (
 )
 
 type LoginBufferCredentials struct {
-	OpenID       string `json:"openid"`
-	AccessToken  string `json:"accesstoken"`
-	RefreshToken string `json:"refreshtoken"`
-	LoginType    string `json:"logintype"`
-	Nickname     string `json:"nickname"`
-	ExpiresAt    int64  `json:"expires_at"`
-	ExpiresIn    int64  `json:"expires_in"`
+	OpenID                 string `json:"openid"`
+	AccessToken            string `json:"accesstoken"`
+	RefreshToken           string `json:"refreshtoken"`
+	RefreshTokenObservedAt int64  `json:"refresh_token_observed_at"`
+	LoginType              string `json:"logintype"`
+	Nickname               string `json:"nickname"`
+	ExpiresAt              int64  `json:"expires_at"`
+	ExpiresIn              int64  `json:"expires_in"`
 }
 
 func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
+	expiresIn := defaultInt64(int64FromMap(m, "expires_in"), 7200)
+	expiresAt := int64FromMap(m, "expires_at")
+	// 兼容早期没有 expires_at 的记录：用上次刷新时间加有效期推算，
+	// 否则这类账号的剩余有效期永远算不出来，界面上只能显示"未记录"。
+	if expiresAt <= 0 {
+		if refreshedAt := int64FromMap(m, "refresh_refreshed_at"); refreshedAt > 0 {
+			expiresAt = refreshedAt + expiresIn
+		}
+	}
 	return LoginBufferCredentials{
-		OpenID:       stringFromMap(m, "openid"),
-		AccessToken:  stringFromMap(m, "accesstoken"),
-		RefreshToken: stringFromMap(m, "refreshtoken"),
-		LoginType:    defaultString(stringFromMap(m, "logintype"), "WX"),
-		Nickname:     stringFromMap(m, "nickname"),
-		ExpiresAt:    int64FromMap(m, "expires_at"),
-		ExpiresIn:    defaultInt64(int64FromMap(m, "expires_in"), 7200),
+		OpenID:                 stringFromMap(m, "openid"),
+		AccessToken:            stringFromMap(m, "accesstoken"),
+		RefreshToken:           stringFromMap(m, "refreshtoken"),
+		RefreshTokenObservedAt: int64FromMap(m, "refresh_token_observed_at"),
+		LoginType:              defaultString(stringFromMap(m, "logintype"), "WX"),
+		Nickname:               stringFromMap(m, "nickname"),
+		ExpiresAt:              expiresAt,
+		ExpiresIn:              expiresIn,
 	}
 }
 
 func (c LoginBufferCredentials) ToMap() map[string]any {
 	return map[string]any{
-		"openid":               c.OpenID,
-		"accesstoken":          c.AccessToken,
-		"refreshtoken":         c.RefreshToken,
-		"logintype":            defaultString(c.LoginType, "WX"),
-		"nickname":             c.Nickname,
-		"expires_at":           c.ExpiresAt,
-		"expires_in":           defaultInt64(c.ExpiresIn, 7200),
-		"refresh_refreshed_at": time.Now().Unix(),
+		"openid":                    c.OpenID,
+		"accesstoken":               c.AccessToken,
+		"refreshtoken":              c.RefreshToken,
+		"refresh_token_observed_at": c.RefreshTokenObservedAt,
+		"logintype":                 defaultString(c.LoginType, "WX"),
+		"nickname":                  c.Nickname,
+		"expires_at":                c.ExpiresAt,
+		"expires_in":                defaultInt64(c.ExpiresIn, 7200),
+		"refresh_refreshed_at":      time.Now().Unix(),
 	}
+}
+
+// ToMapForScan 序列化一次成功扫码得到的凭据。
+//
+// 30 天窗口计的是「扫码授权」那一刻，不是保活偶然刷新到某个老账号的时刻。
+// 只有这里才补写 refresh_token_observed_at，避免缺少该字段的历史记录被回填成
+// 一个「刚刚扫码」的假时间戳。
+func (c LoginBufferCredentials) ToMapForScan() map[string]any {
+	if c.RefreshToken != "" && c.RefreshTokenObservedAt <= 0 {
+		c.RefreshTokenObservedAt = time.Now().Unix()
+	}
+	return c.ToMap()
+}
+
+// Expired 判断凭据是否已在 skew 容差内过期。
+func (c LoginBufferCredentials) Expired(skew time.Duration) bool {
+	return time.Now().Add(skew).Unix() >= c.ExpiresAt
 }
 
 type LoginBufferResult struct {
@@ -70,8 +124,17 @@ type LoginBufferClient struct {
 }
 
 func NewLoginBufferClient(timeout time.Duration) *LoginBufferClient {
+	return NewLoginBufferClientWithHTTPClient(&http.Client{Timeout: timeout}, timeout)
+}
+
+// NewLoginBufferClientWithHTTPClient 允许调用方注入自定义 HTTP 客户端，
+// 例如绑定了账号代理的客户端。
+func NewLoginBufferClientWithHTTPClient(httpClient *http.Client, timeout time.Duration) *LoginBufferClient {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: timeout}
+	}
 	return &LoginBufferClient{
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: httpClient,
 		timeout:    timeout,
 	}
 }
@@ -102,8 +165,8 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 	}, &data); err != nil {
 		return "", err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return "", fmt.Errorf("login_buffer failed: code=%v msg=%v", data["code"], data["msg"])
+	if code := intFromAny(data["code"]); code != 0 {
+		return "", &LoginBufferRejectedError{Code: code, Message: fmt.Sprint(data["msg"])}
 	}
 	values := stringSlicePath(data, "ext_info", "list_s", "login_buffer", "value")
 	if len(values) == 0 || values[0] == "" {
@@ -114,7 +177,7 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 
 func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
 	if creds.RefreshToken == "" {
-		return LoginBufferCredentials{}, fmt.Errorf("missing refresh token")
+		return LoginBufferCredentials{}, ErrMissingRefreshToken
 	}
 	body, err := json.Marshal(refreshTokenRequest{UserInfo: refreshTokenUserInfo{
 		OpenID:       creds.OpenID,
@@ -136,15 +199,17 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 	}, &data); err != nil {
 		return LoginBufferCredentials{}, err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return LoginBufferCredentials{}, fmt.Errorf("refresh failed: code=%v msg=%v", data["code"], data["msg"])
+	if code := intFromAny(data["code"]); code != 0 {
+		return LoginBufferCredentials{}, &RefreshRejectedError{Code: code, Message: fmt.Sprint(data["msg"])}
 	}
 	info, _ := data["user_info"].(map[string]any)
 	expiresIn := defaultInt64(int64FromMap(info, "expires_in"), 7200)
 	refreshed := creds
 	refreshed.AccessToken = stringFromMap(info, "access_token")
-	if rt := stringFromMap(info, "refresh_token"); rt != "" {
+	// 微信侧轮换 refresh token 时才更新；30 天扫码窗口随之重新开始计时。
+	if rt := stringFromMap(info, "refresh_token"); rt != "" && rt != refreshed.RefreshToken {
 		refreshed.RefreshToken = rt
+		refreshed.RefreshTokenObservedAt = time.Now().Unix()
 	}
 	refreshed.ExpiresIn = expiresIn
 	refreshed.ExpiresAt = time.Now().Unix() + expiresIn

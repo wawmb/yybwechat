@@ -134,11 +134,13 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 wawmb/yybwechat:la
 | 管理员认证      | 单管理员账号 + 会话 Cookie + bcrypt，全站管理接口需登录                          |
 | 登录态保持      | MMTLS 会话缓存 + 自动重连，账号存活状态实时检测                                   |
 | 凭据保活       | 后台按凭据剩余有效期提前续期，失败自动退避重试                                        |
+| 双轨生命周期展示   | 账号卡片同时显示「保活凭据」与「扫码 30 天窗口」两条进度条，最后 5 天提示重扫                    |
 | wxapp 能力代理 | getCode / getPhoneNumber / operateWxData / getUserInfo / oauth |
 | 协议令牌       | 可选的 Bearer 令牌，用于保护 `/wxapp/*`；留空则不校验，脚本零配置即可调用              |
 | 掉线通知       | 账号状态变更时推送 Webhook，支持企业微信 markdown 卡片                           |
 | 账号维护       | 备注管理、残缺账号清理、账号 ID 紧凑化                                          |
 | OpenAPI 文档 | 内置 Swagger UI，可导出 JSON 导入 Postman                              |
+| 账号级代理      | 每个账号可独立配置静态代理或动态提取代理，支持品赞 / 巨量供应商配置库与按省市选出口，代理页 `/proxies`     |
 | 代理穿透       | 支持 SOCKS5 / HTTP CONNECT 代理，海外服务器也能用                           |
 | 稳定设备标识     | 每个账号持久化唯一设备 MAC，避免微信风控                                         |
 | 纯 Go 实现    | 无需微信客户端、无需外部数据库，一个二进制搞定                                        |
@@ -152,9 +154,16 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 wawmb/yybwechat:la
 
 概览区顶部是账号计数与状态图例，三种状态含义见[账号状态取值](#账号管理)。「待确认」用琥珀色标记，它**不代表掉线**：服务保留着该账号的会话并在后台按递增退避重试，恢复后自动回到「可用」，期间不会推送告警。
 
-### 凭据剩余有效期
+### 双轨生命周期进度条
 
-每张账号卡片会显示 `⏱ 凭据剩余 X 小时 Y 分`。剩余不足 45 分钟时标签转为琥珀色提醒，已过期转为红色。这个数字直接反映后台**凭据保活**的效果——正常情况下它会在归零之前被自动续期。
+每张账号卡片下方是两条独立衰减的进度条：
+
+- **保活凭据**：短效凭据的剩余时间（默认 2 小时量级），反映后台保活是否在正常续期；
+- **扫码 30 天**：从扫码那一刻起算的 30 天授权窗口，剩余不足 5 天进度条转琥珀色，服务端会同时把 `rescan_recommended` 置为 true，卡片上出现「⚠ 建议重新扫码」。
+
+两条曲线衰减速度差两个数量级，分开画才能同时看清「保活是否在跑」和「是否该重扫」。把鼠标悬停在卡片上，详情浮层里还有扫码时间与窗口剩余的精确数值。`expired` 账号显示「保活已停止 · 重新扫码后恢复」。
+
+> **「扫码时间未记录」**：`refresh_token_observed_at` 是后来才加入的字段，在此之前的扫码不会留下时间戳。这类账号的 30 天窗口无法计算，卡片显示「未记录」，且不会触发「建议重新扫码」——在方便的时候重新扫码一次，时间戳就会开始记录。
 
 ### 调用面板按能力切换参数
 
@@ -171,12 +180,13 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 wawmb/yybwechat:la
 
 ### 单账号操作
 
-账号卡片右上角三个按钮：
+账号卡片右上角四个按钮：
 
 | 按钮 | 作用                                     |
 | -- | -------------------------------------- |
 | ✎  | 设置/清除备注（纯本地字段，不参与微信侧同步）                |
 | ⇄  | 手动修正状态为「可用」或「需重扫」。标记为需重扫时会同时清理该账号的登录会话 |
+| 🌐 | 跳转到该账号的代理设置页 `/proxies?ref=<账号ID>`     |
 | 🗑 | 删除账号                                   |
 
 批量操作（刷新存活、同步资料、整理 ID、清理残留）在概览区右侧的快捷操作区。
@@ -187,7 +197,7 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 wawmb/yybwechat:la
 
 ### 单一设计基线
 
-四个页面（控制台 `/`、扫码 `/scan`、登录 `/login`、初始化 `/setup`）共用一份 `resource/static/css/console.css`（约 330 行），页面各自的 `<style>` 只保留**布局与页面专属样式**。
+五个页面（控制台 `/`、代理设置 `/proxies`、扫码 `/scan`、登录 `/login`、初始化 `/setup`）共用一份 `resource/static/css/console.css`（约 330 行），页面各自的 `<style>` 只保留**布局与页面专属样式**。
 
 收敛前四个模板各自内联一整套 token，合计约 680 行重复定义。收敛之后：
 
@@ -258,8 +268,8 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 wawmb/yybwechat:la
 │  ┌────────────────────────────────────────────────┐   │
 │  │              路由分组（安全边界）                │   │
 │  │  公开组   /login /setup /api/auth/* /health     │   │
-│  │           GET /accounts   ← 只读·免认证·无令牌  │   │
-│  │  协议组   /wxapp/*        ← 可选 Bearer 令牌门禁│   │
+│  │  协议组   /wxapp/* /wx/oauth  ← 可选 Bearer 令牌│   │
+│  │           GET /accounts       ← 只读·同受令牌门禁│   │
 │  │  管理组   / /scan /accounts/refresh 等 ← 需登录 │   │
 │  └────────────────────────────────────────────────┘   │
 │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐   │
@@ -376,8 +386,9 @@ docker cp ./backup-yybwechat/. yybwechat:/app/data/
 | `--keepalive-interval` | `60`              | `YYB_KEEPALIVE_INTERVAL` | 凭据保活扫描间隔（秒），设 0 禁用             |
 | `--keepalive-ahead`    | `2700`            | `YYB_KEEPALIVE_AHEAD`    | 凭据剩余有效期低于此秒数时提前续期              |
 | `--session-hours`      | `168`             | `YYB_SESSION_HOURS`      | 管理员会话有效期（小时）                   |
-| `--protocol-token`     | (空)               | `YYB_PROTOCOL_TOKEN`     | `/wxapp/*` 的 Bearer 令牌，空表示不校验  |
+| `--protocol-token`     | (空)               | `YYB_PROTOCOL_TOKEN`     | `/wxapp/*`、`/wx/oauth` 与 `GET /accounts` 的 Bearer 令牌，空表示不校验 |
 | `--cookie-secure`      | `false`           | `YYB_COOKIE_SECURE`      | 为会话 Cookie 加 Secure（HTTPS 时开启） |
+| `--trust-proxy`        | `false`           | `YYB_TRUST_PROXY`        | 信任反向代理传来的 `X-Forwarded-For` / `X-Real-IP`（仅部署在可信代理后开启） |
 
 > **优先级**：显式命令行参数 > 环境变量 > 默认值。
 >
@@ -432,18 +443,33 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 \
   wawmb/yybwechat:latest --keepalive-interval 0
 ```
 
-**失败处理分两类**，避免把一次网络抖动误判成掉线：
+**失败处理分三类**，既要避免把网络抖动误判成掉线，也要保证「真的续不上」一定通知到人：
 
-| 判定                                            | 账号状态      | 后续行为                     |
-| --------------------------------------------- | --------- | ------------------------ |
-| 明确命中「凭据彻底失效」（如 `42007 refresh_token expired`） | `expired` | 停止自动续期，需重新扫码；会推送掉线通知     |
-| 网络抖动、超时等瞬时错误                                  | `unknown` | 保留会话并按**指数递增退避**重试，不推送告警 |
+| 判定                                            | 账号状态      | 后续行为                     | 推送 |
+| --------------------------------------------- | --------- | ------------------------ | -- |
+| 命中已知失效码（`42007` refresh token 失效、`40188` scope 无效） | `expired` | 停止自动续期，需重新扫码            | `status_changed` |
+| 微信侧明确拒绝（业务码非 0）**且**缓存凭据已过期                    | `expired` | 同上。实测失效令牌常返回 `-109 RC_PARAMS_INVALID` 而非标准 42007 | `status_changed` |
+| 其它刷新失败（网络、代理、超时）**且**缓存凭据已过期                   | `unknown` | 保留会话继续重试，网络/代理恢复后可自愈     | `renewal_failed` |
+| 刷新失败但凭据尚未过期                                  | 维持原状态     | 保活还有时间窗口，继续尝试            | 不推送 |
 
-退避从 5 分钟起按 2 倍递增（5 → 10 → 20 → 40 分钟），封顶 1 小时；刷新成功后立即清零。只有收敛到终态（`alive` / `expired`）才会推送 Webhook，`unknown` 不会制造告警噪音。
+关键在于第三行：**凭据一旦越过到期时刻又没能续上，账号此刻就是不可用的**，不管原因是账号失效还是代理配错，都必须告诉运营者。但这种情况不能直接判 `expired`——那是终态，会永久停止重试，一个临时性的代理故障就会把所有账号钉死。所以状态留在 `unknown` 继续自愈，同时单独推一条「无法续期」告警。
+
+退避从 5 分钟起按 2 倍递增（5 → 10 → 20 → 40 分钟），封顶 1 小时；刷新成功后立即清零。只有收敛到终态（`alive` / `expired`）才会推送状态变更，`unknown` 不会制造告警噪音。
+
+> **通知出口唯一**：手动刷新（`/accounts/refresh`）、wxapp 调用失败后的凭据补救、后台保活三条路径都收敛到同一个刷新实现，状态跃迁的通知在刷新内部发出。这修复了早期「后台先把账号置为 expired 就跳过、其它路径改状态却不推送」导致的掉线漏报。
 
 ### Webhook 掉线通知
 
-当账号状态收敛到终态时（`alive` ↔ `expired`），自动向配置的 Webhook 地址推送 JSON 通知。`unknown` 属于中间态，不推送。
+服务会推送两类事件：
+
+| 事件 | 触发条件 | 含义 |
+| -- | -- | -- |
+| `status_changed` | 状态收敛到终态（`alive` ↔ `expired`） | 账号掉线或恢复；`expired` 需重新扫码 |
+| `renewal_failed` | 凭据已过期且本轮刷新失败，但原因不是明确失效 | 账号此刻**用不了**，但仍在重试自愈；先排查代理/网络 |
+
+`unknown` 作为中间态本身不推送——除非它已经伴随「凭据过期 + 续不上」，此时走 `renewal_failed`。
+
+**`status_changed` 示例：**
 
 ```json
 {
@@ -460,6 +486,20 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 \
 }
 ```
 
+**`renewal_failed` 示例：**
+
+```json
+{
+  "event": "renewal_failed",
+  "timestamp": 1720153200,
+  "account": { "id": 1, "openid": "oXXXX", "uin": 123456, "nickname": "张三" },
+  "current": "unknown",
+  "reason": "dial proxy failed: dial tcp 127.0.0.1:9: connect: connection refused"
+}
+```
+
+`renewal_failed` 自带去重：同一故障周期只推一次，凭据续上后自动复位；若账号持续瘫痪，每 6 小时再提醒一次，避免响过一声就沉默。
+
 **配置方式：**
 
 - **控制台 UI**：在首页侧边栏「🔔 掉线通知」面板填入地址、保存、测试
@@ -467,6 +507,36 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 \
 - **读取**：`GET /settings/webhook` → `{"url":"..."}`
 
 企业微信机器人地址会被自动识别，改用 `markdown_v2` 卡片格式推送。日志中的 Webhook URL 会自动脱敏 query string，避免把密钥写进日志。
+
+**送达保证（不会漏报）：**
+
+推送成功才记账；失败则保持旧标记不动，下一轮扫描时自动补推。三类事件各自记账：
+
+| 事件 | 含义 | 记账列 | 重试方式 |
+| -- | -- | -- | -- |
+| `status_changed` | 状态跃迁（如 可用 → 需重扫） | `status_notified` | 每轮扫描比对 `status` 与 `status_notified`，不一致就重推 |
+| `account_expired` | 账号**当前仍然是** `expired` | `expiry_alerted_at` | 不看跃迁，只看当前状态；超过 6 小时未重扫就再提醒一次 |
+| `renewal_failed` | 凭据已过期但续不上（状态仍可自愈） | `expiry_alerted_at` | 未送达则不写；超过 6 小时仍未恢复会再次提醒 |
+
+> **失效账号一定会被推到**：`expired` 是终态，保活与健康检查都会跳过它（刷不回来），手动刷新也不会产生新的状态跃迁。所以`account_expired` 刻意不依赖跃迁——只要账号还挂着 `expired`，每轮扫描都会检查并推送，6 小时重提醒一次，直到你重新扫码为止。三个事件共用 `expiry_alerted_at` 记账，因此同一条事实不会连发两份。
+
+这一点很关键：账号一旦被判为 `expired`，保活与健康检查都会跳过它（终态，救不回来）。如果那次推送恰好失败又没人重试，状态已经落库、后续再没有任何路径会重算它，告警就永久丢失——运营者只会看到"账号莫名其妙不干活了"。补推让这件事变成"晚一点收到"而不是"永远收不到"。
+
+| 场景 | 行为 |
+| -- | -- |
+| 推送成功 | 记账，同一状态不会重复打扰 |
+| 推送失败（网络、Webhook 非 2xx、企业微信 errcode≠0） | 不记账，下一轮扫描补推；Webhook 恢复后自动送达 |
+| 未配置 Webhook | 不推送也不补推，等运营者补齐地址后下一轮自动补发 |
+| 服务重启 | 待补推信息已落库，重启后继续重试 |
+| 升级旧版本 | 首次启动把现有状态回填为「已通知」，alive 账号不会补推刷屏 |
+| 升级前账号已经失效 | 一次性修复迁移把这类账号重新标记为待推送：升级后第一轮扫描各补推**一次**「需重扫」告警（用 settings 标记保证不会随重启反复触发） |
+| 账号持续瘫痪 | `renewal_failed` 每 6 小时重复提醒一次，直到续期成功或重新扫码 |
+| 账号一直没重新扫码 | `account_expired` 每 6 小时重复提醒一次，直到重新扫码恢复 |
+| 脚本调到失效账号 | `/wxapp/*` 命中 `expired` 时也会告警（同一 6 小时窗口去重） |
+| 手动点「刷新存活」 | 失效账号在**发起刷新之前**先发一条 `account_expired`；刷新成功恢复则改发「已恢复可用」 |
+| 手动刷新后状态变成 unknown | 网络失败不算证据，但失效告警照发（不能因为状态被降级就当成问题消失） |
+
+> 补推没有次数上限，只要 Webhook 还挂着就一直重试（默认每 60 秒一次，开销极小）。这是刻意的取舍：掉线告警宁可不厌其烦，也不能悄悄消失。
 
 ### TCP 代理
 
@@ -480,6 +550,22 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 \
 docker run -d --name yybwechat --restart=always -p 60006:8000 \
   wawmb/yybwechat:latest --tcp-proxy http-connect://proxy.example.com:3128
 ```
+
+`--tcp-proxy` 是**全局兜底**：没有单独配置代理的账号会使用它。
+
+### 账号级代理与代理设置页
+
+控制台顶栏的「代理设置」进入 `/proxies`，可以做两件事：
+
+1. **代理配置库**：把品赞提取链接、巨量业务编号 + API Key 或一条静态代理地址存成可复用的配置。品赞支持按 6 位地区编码选省/市；巨量由服务端按账号省市动态签名。
+2. **账号级出口**：为每个账号独立选择 直连 / 静态代理 / 自定义提取 API / 配置库，并可单独指定小程序调用的出口（跟随账号或直连）。
+
+注意事项：
+
+- **动态提取（品赞 / 巨量）是短效代理**，每次提取都会换出口，无法维持微信登录会话，系统会自动关闭这类账号的后台保活并给出提示；静态代理不受影响。
+- 保存代理会**作废该账号已缓存的 MMTLS 会话**，下一次调用会重新登录。
+- 「测试代理」会立即提取一次并探测实际出口 IP 与归属地；「按位置推荐地区」优先用浏览器定位，拿不到时退回 IP 归属地。
+- 全局兜底 `--tcp-proxy` 与账号级代理同时存在时，账号级配置优先。
 
 ---
 
@@ -505,8 +591,10 @@ docker run -d --name yybwechat --restart=always -p 60006:8000 \
 | 路由分组                                                                            | 认证方式                                     |
 | ------------------------------------------------------------------------------- | ---------------------------------------- |
 | `/health`、`/login`、`/setup`、`/api/auth/*`、`/openapi.json`、`/static/*`              | 公开                                       |
-| `GET /accounts`（**只读**）                                                          | 公开，且**不需要任何令牌**                          |
-| `/wxapp/*`                                                                      | 可选 Bearer 令牌（配置 `YYB_PROTOCOL_TOKEN` 后启用）   |
+| `GET /accounts`（**只读**）                                                          | 免登录，但**受协议令牌保护**（配置后需带 Bearer）             |
+| `/wxapp/*`、`/wx/oauth`                                                          | 可选 Bearer 令牌（配置 `YYB_PROTOCOL_TOKEN` 后启用）   |
+
+> **令牌门禁也认管理员会话**：配置 `YYB_PROTOCOL_TOKEN` 后，上面两组接口同时接受「正确的 Bearer 令牌」或「已登录的管理员会话 Cookie」。因为控制台页面本身就要调 `/accounts`（账号列表）和 `/wxapp/*`（调用面板），而浏览器只会带 Cookie、不会自己加令牌；如果门禁只认令牌，一开令牌控制台就全线 401，前端又会把 401 当成会话过期踢回登录页。
 | 其余全部路由（`/accounts/refresh`、`/accounts/resync`、`/accounts/status`、`/settings*`、`/qr*`、`/`、`/scan`、`/docs` 等） | 管理员会话 Cookie，或 `Authorization: Bearer <会话令牌>` |
 
 未登录时，机器调用类路径（`/api/*`、`/accounts*`）返回 `401 JSON`，页面路径返回 `303` 跳转到 `/login` 或 `/setup`。
@@ -520,7 +608,8 @@ import httpx
 
 BASE = "http://192.168.85.235:60006"
 
-# 第一步：拉取账号列表。GET /accounts 是公开只读接口，裸请求即可。
+# 第一步：拉取账号列表。GET /accounts 免登录；若服务端配置了 protocol-token，
+# 记得带上 Authorization: Bearer <令牌>，未配置时裸请求即可。
 accounts = httpx.get(f"{BASE}/accounts", timeout=10).json()["data"]
 alive = [a for a in accounts if a.get("status") == "alive"]
 
@@ -543,7 +632,9 @@ r = httpx.post(f"{BASE}/wxapp/getCode", json={"ref": alive[0]["openid"], "app_id
 | `credential_expires_at` | int     | 凭据到期时间戳，0 表示未知                |
 | `created_at` / `updated_at` | int | 创建 / 更新时间戳                    |
 
-> **为什么 `GET /accounts` 免认证？** 它是脚本调用链的第一步，用来探测服务是否存活并挑选在线账号。如果要求脚本先做交互式登录，无人值守的定时任务就直接断链了。放开的是**只读且脱敏**的那一个方法：`DELETE /accounts` 与其它写操作仍在处理器内部二次鉴权，只认管理员会话，不接受任何静态令牌。
+> **为什么 `GET /accounts` 免登录？** 它是脚本调用链的第一步，用来探测服务是否存活并挑选在线账号。如果要求脚本先做交互式登录，无人值守的定时任务就直接断链了。放开的是**只读且脱敏**的那一个方法：`DELETE /accounts` 与其它写操作仍在处理器内部二次鉴权，只认管理员会话，不接受任何静态令牌。
+>
+> 但免登录 ≠ 不需要任何防护。它和 `/wxapp/*` 一样挂在**协议令牌门禁**下：一旦配置了 `--protocol-token`，脚本就要在请求头带上 `Authorization: Bearer <令牌>`，否则返回 401。这样在把服务暴露到公网时，至少有一道统一的口令挡在「拉账号列表」和「消费一次性 code」前面。
 
 `ref` 支持三种标识符，服务端会依次尝试匹配：账号 `id`、`openid`、`nickname`。
 
@@ -617,6 +708,50 @@ POST /qr → 展示二维码 → 微信扫码 → 轮询 /qr/{id}/poll → 用�
 | `expired` | 凭据已彻底失效，必须重新扫码            | 需重扫   |
 | `unknown` | 本轮无法判定（网络抖动、超时、尚无凭据），等待重试 | 待确认   |
 
+**账号列表额外字段**（`GET /accounts` 返回的 `AccountPublic`）：
+
+| 字段                          | 说明                                                    |
+| --------------------------- | ----------------------------------------------------- |
+| `credential_expires_at`     | 凭据到期时间戳（Unix 秒），反映保活续期效果                              |
+| `credential_expires_in`     | 本次凭据发放时的有效期秒数（剩余比例的分母）                                |
+| `refresh_token_observed_at` | refresh token 首次被观察到的时间戳，用于推算 30 天扫码授权窗口；仅扫码成功那一刻写入   |
+| `rescan_recommended`        | 扫码窗口进入最后 5 天（或缓存凭据已越过到期时刻且状态不明）时为 true，控制台据此显示「建议重新扫码」 |
+
+### 代理管理
+
+| 方法       | 路径                                  | 说明                                        |
+| -------- | ----------------------------------- | ----------------------------------------- |
+| `GET`    | `/accounts/proxy?ref={ref}`         | 读取账号代理配置（含 `keepalive_supported` 与 `proxy_warning`） |
+| `PUT`    | `/accounts/proxy`                   | 保存账号代理配置，并作废该账号已缓存的 MMTLS 会话              |
+| `POST`   | `/accounts/proxy/test`              | 立即提取一次代理并探测出口 IP 与归属地（只传 ref 表示测已保存配置）    |
+| `GET`    | `/api/proxy-profiles`               | 列出代理供应商配置                                 |
+| `POST`   | `/api/proxy-profiles`               | 新增供应商配置（品赞提取链接 / 巨量业务编号 / 静态代理地址）         |
+| `PUT`    | `/api/proxy-profiles/{id}`          | 更新供应商配置                                   |
+| `DELETE` | `/api/proxy-profiles/{id}`          | 删除供应商配置，引用它的账号退回直连                        |
+| `GET`    | `/api/proxy-profiles/areas/provinces` | 品赞省份地区编码列表                                |
+| `GET`    | `/api/proxy-profiles/areas/cities?province={code}` | 品赞城市地区编码列表（6 位省份编码）        |
+| `POST`   | `/api/proxy-location/recommend`     | 按浏览器经纬度（缺省退回 IP 归属地）推荐代理省市编码              |
+
+**保存账号代理（`PUT /accounts/proxy`）请求体：**
+
+```json
+{
+  "ref": "1",
+  "mode": "direct | static | api",
+  "protocol_proxy_mode": "account | direct",
+  "proxy_type": "http | socks5",
+  "static_proxy": "user:pass@1.2.3.4:8080",
+  "api_url": "https://供应商提取接口",
+  "provider_profile_id": 1,
+  "region_code": "440300",
+  "region_province": "广东省",
+  "region_city": "深圳市",
+  "refresh_ahead_minutes": 15
+}
+```
+
+引用配置库时只需 `ref` + `provider_profile_id` + 地区字段，`mode` 会被服务端按配置类型改写（静态预设 → `static`，动态供应商 → `api`）。响应中 `lifetime_class` 为 `short` 且 `keepalive_supported` 为 `false` 时表示动态短效代理，后台保活已自动关闭。
+
 ### wxapp 能力调用
 
 | 方法           | 路径                      | 说明                               |
@@ -626,6 +761,7 @@ POST /qr → 展示二维码 → 微信扫码 → 轮询 /qr/{id}/poll → 用�
 | `POST`       | `/wxapp/operateWxData`  | 调用 operateWxData 接口（微信小程序数据操作）   |
 | `GET`/`POST` | `/wxapp/getUserInfo`    | 获取微信用户信息（走 HTTPS 通道，无需 MMTLS 会话） |
 | `POST`       | `/wxapp/oauth`          | 构造公众号网页授权 URL                    |
+| `POST`       | `/wx/oauth`             | 同上，早期脚本使用的兼容别名（行为完全一致）           |
 
 **请求体：**
 
@@ -660,6 +796,16 @@ POST /qr → 展示二维码 → 微信扫码 → 轮询 /qr/{id}/poll → 用�
 
 返回 `url` 与 `full_url`（带 `#wechat_redirect`）。**该接口只生成授权链接**，code 必须由用户在微信客户端内完成授权后由回调地址携带返回，服务端无法也不应伪造。
 
+`app_id` 也可以用旧字段名 `appid` 传（两者等价，同时存在时以 `app_id` 为准）。传了 `ref` 时响应会回填 `account_id` 与 `openid`。
+
+因为 code 必须等用户操作，响应里 `code` 恒为 `null`，并附三个提示字段，方便脚本判断「这一步该等回调，而不是重试」：
+
+| 字段 | 值 |
+| --- | --- |
+| `authorization_required` | `true` — 必须由用户在微信内完成授权 |
+| `callback_code_source` | `redirect_uri` — code 只会出现在回调参数里 |
+| `next_step` / `callback_params` | 自然语言说明；回调参数固定为 `["code","state"]` |
+
 ### 系统设置
 
 | 方法     | 路径                       | 说明                                                   |
@@ -681,8 +827,11 @@ yybwechat/
 │   │   ├── auth.go             # 管理员认证中间件与接口
 │   │   ├── wxapp_extra.go      # getUserInfo / oauth 扩展接口
 │   │   ├── qr_confirm.go       # 扫码确认的凭据重试
-│   │   ├── keepalive.go        # 凭据保活后台任务
+│   │   ├── keepalive.go        # 凭据保活后台任务（刷新/状态判定/通知唯一出口）
 │   │   ├── account_maintenance.go # 备注/清理/整理/状态
+│   │   ├── account_proxy.go    # 账号级代理读写/测试/出口探测
+│   │   ├── proxy_profiles.go   # 代理供应商配置库（品赞/巨量/静态）
+│   │   ├── proxy_location.go   # 按位置推荐代理地区
 │   │   ├── openapi.go          # OpenAPI 规范生成
 │   │   ├── fallback_html.go    # 内嵌后备 HTML
 │   │   ├── resources.go        # 资源目录管理
@@ -699,35 +848,40 @@ yybwechat/
 │   │   ├── version.go
 │   │   └── version_test.go     # 版本/提交号回退测试（3 项）
 │   ├── protocol/               # 协议层
-│   │   ├── pool.go             # MMTLS 连接池
+│   │   ├── pool.go             # MMTLS 连接池（含 wx.login code 串行锁）
 │   │   ├── mmtls_client.go     # 客户端握手
 │   │   ├── mmtls_crypto.go     # AES-GCM / ECDH / HKDF
-│   │   ├── loginbuffer.go      # 凭据获取与刷新
+│   │   ├── loginbuffer.go      # 凭据获取与刷新（含结构化错误）
 │   │   ├── ilink.go            # login_buffer 解析与握手请求构造
 │   │   ├── shortlink.go        # 0-RTT 短连接
 │   │   ├── newdns.go           # DNS 解析缓存
 │   │   ├── bytes.go            # protobuf varint / LZ4
-│   │   ├── transport.go        # TCP / 代理
+│   │   ├── transport.go        # TCP / SOCKS5 / HTTP CONNECT 代理
 │   │   ├── bytes_test.go       # 编解码测试（9 项）
 │   │   ├── mmtls_crypto_test.go # 加密层测试（11 项）
 │   │   ├── ilink_test.go       # login_buffer 与设备标识测试（6 项）
 │   │   ├── newdns_test.go      # DNS 纯函数测试（3 项）
 │   │   └── ...
+│   ├── proxysource/            # 代理提取与响应解析（txt/json/json2）
+│   │   └── proxy.go
 │   ├── qr/                     # OAuth 扫码流程
-│   │   ├── qr.go
+│   │   ├── qr.go               # 含代理客户端与二维码图片校验
 │   │   └── qr_test.go          # 状态解析与凭据提取测试（9 项）
 │   └── store/                  # 持久化层
-│       ├── store.go            # 账号、会话、设置
+│       ├── store.go            # 账号、会话、设置（含双轨生命周期推导）
+│       ├── proxy.go            # 账号代理设置
+│       ├── proxy_profiles.go   # 代理供应商配置
 │       ├── maintenance.go      # 备注、清理、ID 紧凑化
 │       └── store_test.go       # 持久化层测试
 ├── resource/
 │   ├── templates/              # HTML 模板（各自只留布局样式）
-│   │   ├── index.html          # Web 控制台
+│   │   ├── index.html          # Web 控制台（含双轨生命周期进度条）
+│   │   ├── proxies.html        # 代理设置页
 │   │   ├── scan.html           # 扫码页面
 │   │   ├── login.html          # 登录页面
 │   │   └── setup.html          # 管理员初始化页面
 │   ├── static/
-│   │   ├── css/console.css     # 统一设计系统：token + 共用组件（四页共用）
+│   │   ├── css/console.css     # 统一设计系统：token + 共用组件（五页共用）
 │   │   ├── js/                 # 预留前端脚本目录
 │   │   └── favicon.png
 │   ├── db/                     # 数据库目录（运行时生成 yyb.db / auth.db）
@@ -760,9 +914,16 @@ yybwechat/
 | `accesstoken`              | 访问令牌，用来换取 login_buffer         |
 | `refreshtoken`             | 刷新令牌，用来在过期前换一对新令牌              |
 | `expires_at` / `expires_in` | 过期时间戳与有效期，默认 7200 秒（2 小时）      |
+| `refresh_token_observed_at` | refresh token 首次被观察到的时间戳（Unix 秒），**只在扫码成功那一刻写入**，保活刷新不改动它 |
+| `refresh_refreshed_at`      | 最近一次凭据续期的时间戳，用于在缺少 `expires_at` 时兜底推算到期时刻 |
 | `nickname` / `logintype`   | 昵称与登录类型（默认 `WX`），仅用于展示         |
 
 > **这组令牌不是微信开放平台 OAuth 签发的。** 它们来自应用宝的登录通道（`yybadaccess.3g.qq.com`，业务 ID `pc_yyb_auth`）：扫码时微信授权给的是应用宝，应用宝再把令牌下发给本服务。因此凭据的续期与失效规则取决于应用宝侧，与微信开放平台的 access_token 不是同一套体系。
+
+凭据有**两条生命周期**，控制台分开显示：
+
+- **保活凭据**（`expires_at` / `expires_in`，2 小时量级）：后台保活在到期前自动续期，反映保活是否正常；
+- **扫码授权窗口**（`refresh_token_observed_at` 起算 30 天）：refresh token 的授权窗口推算值，进入最后 5 天时控制台提示重新扫码。
 
 **凭据本身不能直接调微信接口**，它是两级兑换链的第一环：
 
@@ -930,8 +1091,10 @@ go build -trimpath -ldflags "-s -w \
 - **不要在公网直接暴露服务**。yybwechat 设计为内网/本地使用，建议通过 VPN 或 SSH 隧道访问
 - 如果必须公网访问，务必在前面加一层反向代理（Nginx / Caddy）并配置 HTTPS + 基础认证
 - 公网部署时必须设置 `YYB_COOKIE_SECURE=true` 和随机的 `YYB_PROTOCOL_TOKEN`
-- `GET /accounts` 免认证，会暴露账号的 `openid`、昵称、头像与状态；它不含 `login_buffer` 与 `credentials`，但公网暴露仍会泄露「有哪些账号在线」这一信息，建议只在内网开放
-- `/wxapp/*` 接口默认不校验令牌（保证内网脚本易用性）。配置 `YYB_PROTOCOL_TOKEN` 后需携带 `Authorization: Bearer <token>`
+- `GET /accounts` 免登录，会暴露账号的 `openid`、昵称、头像与状态；它不含 `login_buffer` 与 `credentials`，但公网暴露仍会泄露「有哪些账号在线」这一信息，建议只在内网开放。它与 `/wxapp/*` 共用**同一道协议令牌门禁**，配置 `YYB_PROTOCOL_TOKEN` 后同样需要 Bearer
+- `/wxapp/*` 与 `/wx/oauth` 默认不校验令牌（保证内网脚本易用性）。配置 `YYB_PROTOCOL_TOKEN` 后需携带 `Authorization: Bearer <token>`
+- 启动日志会在「未配置令牌且监听非回环地址」时打印两条 `[security]` 提示，部署时不要忽略
+- **`--trust-proxy` 默认关闭**：`X-Forwarded-For` 在直连场景下可任意伪造，默认信任会让攻击者轮换假 IP 绕过登录失败限流（每 IP 8 次）。只有在反向代理确实会覆盖该头时才开启；开启后请确认代理会**丢弃客户端自带的** `X-Forwarded-For`
 
 
 ### 反向代理示例（Nginx）
@@ -951,11 +1114,16 @@ server {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # 注意用 $remote_addr 而不是 $proxy_add_x_forwarded_for：
+        # 服务端取 X-Forwarded-For 的第一个地址，而 $proxy_add_x_forwarded_for
+        # 会把客户端自带的头原样保留在前面，等于让来访者自己决定日志里的 IP。
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
+
+> 这份配置只有配合 `--trust-proxy` 才会生效；不开启时服务端一律使用 TCP 连接的对端地址。
 
 ### 数据安全
 

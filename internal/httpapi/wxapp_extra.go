@@ -73,6 +73,7 @@ func (a *App) handleGetUserInfo(w http.ResponseWriter, r *http.Request) {
 type oauthRequest struct {
 	Ref            string `json:"ref"`             // 可选，账号引用，仅做存在性校验
 	AppID          string `json:"app_id"`          // 公众号 AppID，18 位且 wx 开头
+	LegacyAppID    string `json:"appid"`           // 旧字段名，与 app_id 等价
 	RedirectURI    string `json:"redirect_uri"`    // 授权回调地址，必须为绝对 http/https URL
 	Scope          string `json:"scope"`           // snsapi_base 或 snsapi_userinfo，默认前者
 	State          string `json:"state"`           // 可选，留空自动生成随机值防 CSRF
@@ -83,9 +84,12 @@ type oauthRequest struct {
 //
 // 重要边界：本接口只生成授权链接，不会产生 code。
 // code 必须由用户在微信客户端内完成授权后，由回调地址携带返回，
-// 服务端无法也不应伪造任何授权结果。
+// 服务端无法也不应伪造任何授权结果。响应里的 code=null 是正常状态，
+// 因此额外给出 authorization_required / callback_code_source / next_step
+// 三个提示字段，让自动化脚本能直接判断「这一步应该等回调，而不是重试」。
 func (a *App) handleOAuth(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/wxapp/oauth" {
+	// /wx/oauth 是早期脚本使用的路径，与 /wxapp/oauth 行为完全一致
+	if r.URL.Path != "/wxapp/oauth" && r.URL.Path != "/wx/oauth" {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -98,11 +102,19 @@ func (a *App) handleOAuth(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	// ref 为可选项，传入时校验账号存在，便于调用方确认授权关联的账号
+	if body.AppID == "" {
+		body.AppID = body.LegacyAppID
+	}
+	// ref 为可选项，传入时校验账号存在，便于调用方确认授权关联的账号，
+	// 并把 account_id / openid 一并回填到响应里。
+	var accountID int64
+	openID := ""
 	if body.Ref != "" {
-		if _, ok := a.resolveAccountRef(w, r, body.Ref); !ok {
+		acc, ok := a.resolveAccountRef(w, r, body.Ref)
+		if !ok {
 			return
 		}
+		accountID, openID = acc.ID, acc.OpenID
 	}
 	res, err := oauth.Build(oauth.Request{
 		AppID:          body.AppID,
@@ -116,10 +128,19 @@ func (a *App) handleOAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"url":       res.URL,
-		"full_url":  res.FullURL,
-		"scope":     res.Scope,
-		"state":     res.State,
-		"authorize": "需要用户在微信内打开该链接完成授权，成功后 code 将回传至 redirect_uri",
+		"url":                    res.URL,
+		"full_url":               res.FullURL,
+		"scope":                  res.Scope,
+		"state":                  res.State,
+		"appid":                  body.AppID,
+		"account_id":             accountID,
+		"openid":                 openID,
+		"code":                   nil,
+		"authorization_required": true,
+		"callback_code_source":   "redirect_uri",
+		"mode":                   "authorization_url",
+		"next_step":              "请在微信内打开 url 并完成授权；授权后微信会请求 redirect_uri?code=...&state=...，当前响应的 code=null 是正常状态。",
+		"callback_params":        []string{"code", "state"},
+		"authorize":              "需要用户在微信内打开该链接完成授权，成功后 code 将回传至 redirect_uri",
 	})
 }

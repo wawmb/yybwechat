@@ -348,7 +348,7 @@ func (a *App) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	log.Printf("[auth] 管理员账号已创建: user=%s ip=%s", u.Username, clientIP(r))
+	log.Printf("[auth] 管理员账号已创建: user=%s ip=%s", u.Username, a.clientIP(r))
 	// 初始化后直接下发会话，省去一次登录
 	a.issueSession(w, r, u)
 }
@@ -363,7 +363,7 @@ func (a *App) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "authentication is disabled")
 		return
 	}
-	ip := clientIP(r)
+	ip := a.clientIP(r)
 	if !a.loginLimit.allow(ip) {
 		writeError(w, http.StatusTooManyRequests, "登录失败次数过多，请稍后再试")
 		return
@@ -394,7 +394,7 @@ func (a *App) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 // issueSession 创建会话、下发 Cookie 并返回管理员信息。
 func (a *App) issueSession(w http.ResponseWriter, r *http.Request, u *auth.User) {
-	token, err := a.auth.CreateSession(r.Context(), u.ID, r.UserAgent(), clientIP(r), a.cfg.SessionDuration)
+	token, err := a.auth.CreateSession(r.Context(), u.ID, r.UserAgent(), a.clientIP(r), a.cfg.SessionDuration)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "创建会话失败: "+err.Error())
 		return
@@ -468,21 +468,27 @@ func (a *App) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 	// 口令变更后让其它设备重新登录，仅保留当前会话
 	if n, err := a.auth.DeleteOtherSessions(r.Context(), u.ID, sessionTokenFromRequest(r)); err == nil && n > 0 {
 		log.Printf("[auth] 口令已修改: user=%s ip=%s，已下线其它 %s 个会话",
-			u.Username, clientIP(r), strconv.FormatInt(n, 10))
+			u.Username, a.clientIP(r), strconv.FormatInt(n, 10))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// clientIP 提取客户端 IP。部署在反向代理后时信任 X-Forwarded-For 的首个地址。
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		if idx := strings.IndexByte(v, ','); idx > 0 {
-			return strings.TrimSpace(v[:idx])
+// clientIP 提取客户端 IP。
+//
+// 只有显式开启 TrustProxy 时才读取 X-Forwarded-For / X-Real-IP：
+// 这两个头在直连场景下可以任意伪造，默认信任会让攻击者用一串假 IP
+// 绕过登录失败限流（每个 IP 各试 8 次），也会把会话记录的登录地址写歪。
+func (a *App) clientIP(r *http.Request) string {
+	if a.cfg.TrustProxy {
+		if v := r.Header.Get("X-Forwarded-For"); v != "" {
+			if idx := strings.IndexByte(v, ','); idx > 0 {
+				return strings.TrimSpace(v[:idx])
+			}
+			return strings.TrimSpace(v)
 		}
-		return strings.TrimSpace(v)
-	}
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return strings.TrimSpace(v)
+		if v := r.Header.Get("X-Real-IP"); v != "" {
+			return strings.TrimSpace(v)
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

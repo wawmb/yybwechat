@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -57,6 +58,32 @@ CREATE TABLE IF NOT EXISTS settings (
     value      TEXT NOT NULL,
     updated_at INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS proxy_provider_profiles (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL UNIQUE,
+    provider   TEXT    NOT NULL DEFAULT 'ipzan',
+    proxy_type TEXT    NOT NULL DEFAULT 'http',
+    api_url    TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS account_proxy_settings (
+    account_id            INTEGER PRIMARY KEY REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    mode                  TEXT    NOT NULL DEFAULT 'direct',
+    proxy_type            TEXT    NOT NULL DEFAULT 'http',
+    static_proxy          TEXT    NOT NULL DEFAULT '',
+    api_url               TEXT    NOT NULL DEFAULT '',
+    provider_profile_id   INTEGER,
+    region_code           TEXT    NOT NULL DEFAULT '',
+    region_province       TEXT    NOT NULL DEFAULT '',
+    region_city           TEXT    NOT NULL DEFAULT '',
+    refresh_ahead_seconds INTEGER NOT NULL DEFAULT 300,
+    protocol_proxy_mode   TEXT    NOT NULL DEFAULT 'account',
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL
+);
 `
 
 // Open 打开或创建 SQLite 数据库，执行建表迁移并返回 DB 实例。
@@ -85,22 +112,26 @@ type WechatAccount struct {
 
 // AccountPublic 是 WechatAccount 的安全公开视图，隐藏了 login_buffer 和 credentials 等敏感字段。
 //
-// credential_expires_at 只暴露凭据的到期时间戳，不暴露 token 本身，
-// 用于在控制台展示「凭据剩余有效期」，让后台凭据保活的效果对用户可见。
+// 凭据相关字段只暴露时间戳与时长，不暴露 token 本身，用于在控制台展示两条生命周期：
+//   - credential_expires_at / credential_expires_in：当前凭据的剩余有效期，反映后台保活的效果；
+//   - refresh_token_observed_at：refresh token 首次被观察到的时间，用于推算 30 天扫码授权窗口。
 type AccountPublic struct {
-	ID                  int64   `json:"id"`
-	OpenID              string  `json:"openid"`
-	UIN                 *int64  `json:"uin"`
-	Alias               *string `json:"alias"`
-	Nickname            *string `json:"nickname"`
-	Avatar              *string `json:"avatar"`
-	Status              *string `json:"status"`
-	DeviceID            *string `json:"device_id"`
-	Remark              *string `json:"remark"`
-	LastCheckedAt       *int64  `json:"last_checked_at"`
-	CredentialExpiresAt int64   `json:"credential_expires_at"`
-	CreatedAt           int64   `json:"created_at"`
-	UpdatedAt           int64   `json:"updated_at"`
+	ID                     int64   `json:"id"`
+	OpenID                 string  `json:"openid"`
+	UIN                    *int64  `json:"uin"`
+	Alias                  *string `json:"alias"`
+	Nickname               *string `json:"nickname"`
+	Avatar                 *string `json:"avatar"`
+	Status                 *string `json:"status"`
+	DeviceID               *string `json:"device_id"`
+	Remark                 *string `json:"remark"`
+	LastCheckedAt          *int64  `json:"last_checked_at"`
+	RefreshTokenObservedAt *int64  `json:"refresh_token_observed_at,omitempty"`
+	CredentialExpiresAt    *int64  `json:"credential_expires_at,omitempty"`
+	CredentialExpiresIn    int64   `json:"credential_expires_in,omitempty"`
+	RescanRecommended      bool    `json:"rescan_recommended"`
+	CreatedAt              int64   `json:"created_at"`
+	UpdatedAt              int64   `json:"updated_at"`
 }
 
 // credentialExpiresAt 从凭据映射中读取到期时间戳，无法判断时返回 0。
@@ -124,6 +155,42 @@ func credentialExpiresAt(credentials map[string]any) int64 {
 		return 0
 	}
 }
+
+// credentialInt64 按 key 读取凭据里的整数字段，无法解析时返回 0。
+func credentialInt64(credentials map[string]any, key string) int64 {
+	if credentials == nil {
+		return 0
+	}
+	switch v := credentials[key].(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	default:
+		return 0
+	}
+}
+
+// credentialString 按 key 读取凭据里的字符串字段。
+func credentialString(credentials map[string]any, key string) string {
+	if credentials == nil {
+		return ""
+	}
+	value, _ := credentials[key].(string)
+	return value
+}
+
+// rescanWindowSeconds 是微信侧的扫码授权窗口长度。
+// 超过这个时长即便保活一直成功，也应提示运营者重新扫码。
+const rescanWindowSeconds = int64(30 * 24 * 60 * 60)
+
+// rescanRecommendSeconds 是开始建议重扫的阈值，比窗口略早，给出提前准备时间。
+const rescanRecommendSeconds = int64(25 * 24 * 60 * 60)
 
 // SessionRow 表示 sessions 表中的一行，存储已建立的 MMTLS 会话。
 type SessionRow struct {
@@ -180,6 +247,18 @@ func Open(path string) (*DB, error) {
 		return nil, err
 	}
 	if err = migrateAddRemark(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateAddStatusNotified(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateAddExpiryAlerted(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err = migrateRepairExpiredNotifications(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -279,14 +358,15 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 	}
 	_, err = db.sql.ExecContext(ctx,
 		`INSERT INTO wechat_accounts
-		(openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		(openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, status_notified, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(openid) DO UPDATE SET
 		login_buffer=excluded.login_buffer, alias=excluded.alias, nickname=excluded.nickname,
 		avatar=excluded.avatar, user_info=excluded.user_info, credentials=excluded.credentials,
-		status=excluded.status, updated_at=excluded.updated_at`,
+		status=excluded.status, status_notified=excluded.status_notified, updated_at=excluded.updated_at,
+		expiry_alerted_at=0`,
 		openid, loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
-		userJSON, credJSON, nullableString(status), now, now,
+		userJSON, credJSON, nullableString(status), nullableString(status), now, now,
 	)
 	if err != nil {
 		return nil, err
@@ -402,6 +482,21 @@ func (db *DB) SetAccountCredential(ctx context.Context, id int64, loginBuffer st
 	return err
 }
 
+// SetAccountCredentialStatus 在同一个事务里更新凭据与状态。
+// 保活刷新成功后调用，避免出现「凭据已换新但状态仍是 unknown」的中间态。
+func (db *DB) SetAccountCredentialStatus(ctx context.Context, id int64, loginBuffer string, credentials map[string]any, status string) error {
+	credJSON, err := marshalNullable(credentials)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	_, err = db.sql.ExecContext(ctx,
+		"UPDATE wechat_accounts SET login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=? WHERE id=?",
+		loginBuffer, credJSON, status, now, now, id,
+	)
+	return err
+}
+
 func (db *DB) SetAccountStatus(ctx context.Context, id int64, status string) error {
 	now := time.Now().Unix()
 	_, err := db.sql.ExecContext(ctx,
@@ -450,6 +545,13 @@ func (db *DB) InvalidateSession(ctx context.Context, accountID int64, tcpProxy s
 	return err
 }
 
+// InvalidateAccountSessions 删除指定账号在所有代理下的会话。
+// 凭据变更或判定失效时需要全量清理，否则换代理后仍可能命中旧登录态。
+func (db *DB) InvalidateAccountSessions(ctx context.Context, accountID int64) error {
+	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=?", accountID)
+	return err
+}
+
 // PurgeExpiredSessions 删除所有已过期的会话记录，返回清理的条数。
 // 建议由定时任务周期性调用以避免 sessions 表无限增长。
 func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
@@ -460,21 +562,63 @@ func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 	return res.RowsAffected()
 }
 
+// Public 生成对外暴露的安全视图，并推导出两条生命周期信息。
+//
+// 扫码天数（refresh_token_observed_at）只在扫码成功那一刻写入，保活刷新不会改动它，
+// 因此它真实反映「这串凭据是哪天扫码得来的」。历史记录若没有该字段则保持为空，
+// 界面显示「未记录」，不做猜测性回填。
 func (a *WechatAccount) Public() AccountPublic {
+	var refreshTokenObservedAt *int64
+	rescanRecommended := false
+	var credentialExpiresAtPtr *int64
+
+	credentialExpiresIn := credentialInt64(a.Credentials, "expires_in")
+	if credentialExpiresIn <= 0 {
+		credentialExpiresIn = 7200
+	}
+	if credentialString(a.Credentials, "refreshtoken") != "" {
+		if observedAt := credentialInt64(a.Credentials, "refresh_token_observed_at"); observedAt > 0 {
+			refreshTokenObservedAt = &observedAt
+			rescanRecommended = time.Now().Unix()-observedAt >= rescanRecommendSeconds
+		}
+	}
+	expiresAtValue := credentialExpiresAt(a.Credentials)
+	if expiresAtValue <= 0 {
+		if refreshedAt := credentialInt64(a.Credentials, "refresh_refreshed_at"); refreshedAt > 0 {
+			expiresAtValue = refreshedAt + credentialExpiresIn
+		}
+	}
+	if expiresAtValue > 0 {
+		expiresAt := expiresAtValue
+		credentialExpiresAtPtr = &expiresAt
+		// 保活只把「瞬时失败」记为 unknown 以便重试，但缓存凭据一旦越过到期时刻，
+		// 界面就应引导运营者重扫，而不是让账号看上去仍然健康。
+		status := ""
+		if a.Status != nil {
+			status = strings.ToLower(strings.TrimSpace(*a.Status))
+		}
+		if !rescanRecommended && (status == "" || status == "unknown") && expiresAt <= time.Now().Unix() {
+			rescanRecommended = true
+		}
+	}
+
 	return AccountPublic{
-		ID:                  a.ID,
-		OpenID:              a.OpenID,
-		UIN:                 a.UIN,
-		Alias:               a.Alias,
-		Nickname:            a.Nickname,
-		Avatar:              a.Avatar,
-		Status:              a.Status,
-		DeviceID:            a.DeviceID,
-		Remark:              a.Remark,
-		LastCheckedAt:       a.LastCheckedAt,
-		CredentialExpiresAt: credentialExpiresAt(a.Credentials),
-		CreatedAt:           a.CreatedAt,
-		UpdatedAt:           a.UpdatedAt,
+		ID:                     a.ID,
+		OpenID:                 a.OpenID,
+		UIN:                    a.UIN,
+		Alias:                  a.Alias,
+		Nickname:               a.Nickname,
+		Avatar:                 a.Avatar,
+		Status:                 a.Status,
+		DeviceID:               a.DeviceID,
+		Remark:                 a.Remark,
+		LastCheckedAt:          a.LastCheckedAt,
+		RefreshTokenObservedAt: refreshTokenObservedAt,
+		CredentialExpiresAt:    credentialExpiresAtPtr,
+		CredentialExpiresIn:    credentialExpiresIn,
+		RescanRecommended:      rescanRecommended,
+		CreatedAt:              a.CreatedAt,
+		UpdatedAt:              a.UpdatedAt,
 	}
 }
 

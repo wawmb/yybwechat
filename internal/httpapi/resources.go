@@ -5,6 +5,7 @@ package httpapi
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // resources 定义运行时资源目录结构。
@@ -43,4 +44,18 @@ func (r resources) avatarPath(openid string) string {
 // qrPath 根据会话 ID 生成二维码图片的本地存储路径。
 func (r resources) qrPath(sessionID string) string {
 	return filepath.Join(r.QR, sessionID+".jpg")
+}
+
+// isSafeFileToken 判断一个来自外部的标识符能否安全地拼进文件名。
+//
+// 会话 ID 与 openid 都来自微信响应，正常情况下是字母数字，
+// 但落盘前仍要挡住路径分隔符与 ..，否则一个被篡改的响应就能把文件写到目录之外。
+func isSafeFileToken(token string) bool {
+	if token == "" || token == "." || token == ".." {
+		return false
+	}
+	if strings.ContainsAny(token, `/\`) || strings.Contains(token, "..") {
+		return false
+	}
+	return true
 }
