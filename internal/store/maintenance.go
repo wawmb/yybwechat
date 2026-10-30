@@ -338,32 +338,51 @@ func (db *DB) CompactAccountIDs(ctx context.Context) (map[int64]int64, error) {
 		return nil, err
 	}
 
+	// 所有引用 wechat_accounts(id) 的子表都必须一起迁移。
+	// 这些外键都没有 ON UPDATE CASCADE，漏掉任何一张的后果是：
+	// 提交时被外键检查拒绝（500），或者更糟——旧 ID 落到另一条父行上，
+	// 子表记录被静默错绑到别的账号（比如代理配置跑到别人身上）。
+	childTables := []struct{ table, column string }{
+		{"sessions", "wechat_account_id"},
+		{"account_proxy_settings", "account_id"},
+	}
+
 	parentStmt, err := tx.PrepareContext(ctx, "UPDATE wechat_accounts SET id=? WHERE id=?")
 	if err != nil {
 		return nil, err
 	}
 	defer parentStmt.Close()
-	childStmt, err := tx.PrepareContext(ctx, "UPDATE sessions SET wechat_account_id=? WHERE wechat_account_id=?")
-	if err != nil {
-		return nil, err
+	childStmts := make([]*sql.Stmt, 0, len(childTables))
+	for _, child := range childTables {
+		stmt, err := tx.PrepareContext(ctx,
+			"UPDATE "+child.table+" SET "+child.column+"=? WHERE "+child.column+"=?")
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		childStmts = append(childStmts, stmt)
 	}
-	defer childStmt.Close()
 
 	// 第一步：全部迁移到负 ID，彻底避开与现有正 ID 的冲突
 	for oldID, newID := range mapping {
 		if _, err = parentStmt.ExecContext(ctx, -newID, oldID); err != nil {
 			return nil, err
 		}
-		if _, err = childStmt.ExecContext(ctx, -newID, oldID); err != nil {
-			return nil, err
+		for _, stmt := range childStmts {
+			if _, err = stmt.ExecContext(ctx, -newID, oldID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// 第二步：负值翻正，得到最终连续 ID
 	if _, err = tx.ExecContext(ctx, "UPDATE wechat_accounts SET id=-id WHERE id<0"); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET wechat_account_id=-wechat_account_id WHERE wechat_account_id<0"); err != nil {
-		return nil, err
+	for _, child := range childTables {
+		if _, err = tx.ExecContext(ctx,
+			"UPDATE "+child.table+" SET "+child.column+"=-"+child.column+" WHERE "+child.column+"<0"); err != nil {
+			return nil, err
+		}
 	}
 	// 重置自增序列，避免新账号拿到旧的最大 ID 造成空洞重现
 	if _, err = tx.ExecContext(ctx,

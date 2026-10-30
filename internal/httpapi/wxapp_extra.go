@@ -20,7 +20,20 @@ import (
 // 支持 GET ?ref= 与 POST JSON 两种调用方式。
 // 凭据失效时会先尝试刷新一次再重试，避免刚过期的账号直接报错。
 func (a *App) handleGetUserInfo(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/wxapp/getUserInfo" {
+	a.serveGetUserInfo(w, r, "/wxapp/getUserInfo")
+}
+
+// handleWXGetUserInfo 是 /wxapp/getUserInfo 的兼容入口（小程序端叫 getUserInfo）。
+func (a *App) handleWXGetUserInfo(w http.ResponseWriter, r *http.Request) {
+	a.serveGetUserInfo(w, r, "/wx/getuserinfo")
+}
+
+// serveGetUserInfo 同时服务 /wxapp/getUserInfo 与 /wx/getuserinfo。
+//
+// 路径校验必须带上具体入口：这两个地址共用一份实现，
+// 如果沿用写死的路径判断，另一个入口会恒定返回 404。
+func (a *App) serveGetUserInfo(w http.ResponseWriter, r *http.Request, path string) {
+	if r.URL.Path != path {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}

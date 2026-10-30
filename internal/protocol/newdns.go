@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +21,21 @@ const (
 	longlinkDomain  = "longcloud.weixin.com"
 	shortlinkDomain = "shortcloud.weixin.com"
 	protoMMTLS      = "mmtlsovertcp"
+	protoHTTP       = "http"
 	defaultUA       = "MicroMessenger Client"
 )
+
+// shortlinkFallbackTargets 是 HTTPDNS 不可达时的短链兜底出口。
+//
+// 旧值 120.241.131.173 已被微信下线（实测不通）：微信近期把短链迁到
+// aewebproxy.weixin.qq.com，旧 IP 只能让取码/保活直接失败。这里换成一组
+// 实测可达的官方出口，最后再补一条官方域名，交给 DNS 或代理去解析。
+var shortlinkFallbackTargets = []Target{
+	{IP: "116.128.171.253", Port: 80},
+	{IP: "140.207.120.146", Port: 80},
+	{IP: "182.50.15.223", Port: 80},
+	{IP: "182.50.15.171", Port: 80},
+}
 
 // Target 表示一个 MMTLS 服务的目标地址。
 type Target struct {
@@ -51,6 +63,14 @@ var dnsCache = struct {
 }{entries: map[string]dnsCacheEntry{}}
 
 func buildDNSQuery(clientVersion int, deviceType string, uin int) string {
+	// 早期调用方传 0 / 空串，微信侧会因此拿不到域名列表。
+	// 补上与 ilink 客户端一致的版本号与设备类型，提升解析成功率。
+	if clientVersion == 0 {
+		clientVersion = clientVersionDefault
+	}
+	if deviceType == "" {
+		deviceType = "Windows"
+	}
 	v := url.Values{}
 	v.Set("clientversion", strconv.Itoa(clientVersion))
 	v.Set("devicetype", deviceType)
@@ -69,9 +89,12 @@ func requestNewDNS(ctx context.Context, connectTo string, timeout time.Duration)
 		return 0, nil, "", err
 	}
 	defer conn.Close()
-	if timeout > 0 {
-		_ = conn.SetDeadline(time.Now().Add(timeout))
-	}
+	// 截止时间必须取自 ctx：上层给 HTTPDNS 的预算只是整体登录预算的一部分，
+	// 用 now+timeout 会让 ctx 到期后 io.ReadAll 仍然阻塞到 timeout，
+	// 从而击穿调用方的整体时间预算。
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	_ = conn.SetDeadline(ioDeadline(ctx, timeout))
 	path := newdnsPath + "?" + buildDNSQuery(0, "Windows", 0)
 	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, newdnsHost, defaultUA)
 	if _, err = conn.Write([]byte(req)); err != nil {
@@ -209,54 +232,97 @@ func serversFor(parsed map[string]dnsDomain, domain, proto string) []Target {
 	return out
 }
 
+// getLonglinkTargets 返回 LongLink 候选端点，永不返回空列表。
+//
+// HTTPDNS 只是一项优化：它失败、或返回了 200 却没有 longlink 条目、
+// 或条目里没有可用 IP，都不代表网络不可用——很多网络会拦掉微信 HTTPDNS，
+// 但普通 DNS 与 LongLink 的 443 端口仍然可达。这些情况一律退化为官方域名，
+// 交给 net.Dialer（或已配置的 TCP 代理）去解析，至少还有一次尝试机会。
 func getLonglinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) ([]Target, error) {
 	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		if targets := serversFor(parsed, longlinkDomain, protoMMTLS); len(targets) > 0 {
+			return targets, nil
+		}
 	}
-	return serversFor(parsed, longlinkDomain, protoMMTLS), nil
+	return []Target{{IP: longlinkDomain, Port: 443}}, nil
 }
 
 func getShortlinkTargets(ctx context.Context, timeout, cacheTTL time.Duration) []Target {
-	parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false)
-	if err != nil {
-		return []Target{{IP: "120.241.131.173", Port: 80}}
-	}
-	targets := serversFor(parsed, shortlinkDomain, "http")
-	seen := map[string]bool{}
-	var out []Target
-	for _, t := range targets {
-		if t.Port == 80 && !seen[t.IP] {
-			seen[t.IP] = true
-			out = append(out, t)
-		}
-	}
-	if len(out) == 0 {
-		return []Target{{IP: "120.241.131.173", Port: 80}}
-	}
-	return out
-}
-
-func orderLonglinkTargets(targets []Target, max int) []Target {
-	pref := []int{8080, 80, 443, 5000}
-	seen := map[string]bool{}
-	var out []Target
-	for _, p := range pref {
-		for _, t := range targets {
-			if t.Port == p && !seen[t.IP] {
-				seen[t.IP] = true
-				out = append(out, t)
+	if parsed, err := getDNSParsed(ctx, timeout, cacheTTL, false); err == nil {
+		// 当前后端下发的是 mmtlsoverhttp；回落 http 以兼容旧数据。
+		for _, proto := range []string{"mmtlsoverhttp", protoHTTP} {
+			seen := map[string]bool{}
+			var out []Target
+			for _, t := range serversFor(parsed, shortlinkDomain, proto) {
+				if t.Port == 80 && !seen[t.IP] {
+					seen[t.IP] = true
+					out = append(out, t)
+				}
+			}
+			if len(out) > 0 {
+				return out
 			}
 		}
 	}
-	if len(out) == 0 {
-		out = append(out, targets...)
+	// HTTPDNS 在部分网络下不可用：退到官方出口，最后补域名让
+	// DNS / 代理自行解析（该域名现在 CNAME 到 aewebproxy.weixin.qq.com）。
+	out := append([]Target(nil), shortlinkFallbackTargets...)
+	return append(out, Target{IP: shortlinkDomain, Port: 80})
+}
+
+// orderLonglinkTargets 按端口优先级排列候选，并为未列入优先级的端口兜底。
+//
+// 两个容易踩的点：
+//   - 去重必须按 IP+Port，不能只按 IP。同一个 IP 常同时通告 8080 和 443，
+//     只按 IP 去重会把 443 丢掉；而不少 CONNECT 代理只放行 443，
+//     结果就是所有候选全灭。
+//   - 443 排在最前，同样是因为代理放行端口的限制。同端口内保持解析顺序，
+//     不再按 IP 字典序重排——上游给的顺序本身带有倾向性。
+func orderLonglinkTargets(targets []Target, max int) []Target {
+	pref := []int{443, 8080, 80, 5000}
+	seen := map[Target]bool{}
+	var out []Target
+	add := func(t Target) {
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].IP < out[j].IP })
+	for _, p := range pref {
+		for _, t := range targets {
+			if t.Port == p {
+				add(t)
+			}
+		}
+	}
+	for _, t := range targets {
+		add(t)
+	}
 	if max > 0 && len(out) > max {
 		out = out[:max]
 	}
 	return out
+}
+
+// longlinkLoginTargets 在候选列表末尾永远预留一个官方域名回退位。
+//
+// HTTPDNS 返回成功并不代表它的端点可达；如果候选已经占满名额，
+// 就挤掉最后一个，保证回退位一定在——否则一旦 HTTPDNS 给的 IP 全不通，
+// 这次登录就没有任何退路。
+func longlinkLoginTargets(targets []Target, max int) []Target {
+	fallback := Target{IP: longlinkDomain, Port: 443}
+	ordered := orderLonglinkTargets(targets, 0)
+	out := make([]Target, 0, len(ordered)+1)
+	for _, target := range ordered {
+		if target != fallback {
+			out = append(out, target)
+		}
+	}
+	if max > 0 && len(out) >= max {
+		out = out[:max-1]
+	}
+	return append(out, fallback)
 }
 
 func splitHTTP(raw []byte) (string, []byte) {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -23,6 +24,11 @@ type pskEntry struct {
 type mmtlsClient struct {
 	conn    net.Conn
 	timeout time.Duration
+	// ctx 与 stopCancel 让握手之后的读写也能响应取消。
+	// 只有 dial 阶段用 ctx 是不够的：握手一旦开始，ctx 到期必须能把阻塞中的
+	// Read/Write 打断，否则调用方的整体时间预算形同虚设。
+	ctx        context.Context
+	stopCancel func() bool
 
 	g1Priv *ecdh.PrivateKey
 	g1Pub  []byte
@@ -51,11 +57,17 @@ type mmtlsClient struct {
 	recq  []record
 }
 
-func newMmtlsClient(conn net.Conn, timeout time.Duration) *mmtlsClient {
-	return &mmtlsClient{conn: conn, timeout: timeout}
+func newMmtlsClient(ctx context.Context, conn net.Conn, timeout time.Duration) *mmtlsClient {
+	return &mmtlsClient{conn: conn, timeout: timeout, ctx: ctx,
+		stopCancel: context.AfterFunc(ctx, func() { _ = conn.Close() })}
 }
 
 func (m *mmtlsClient) close() {
+	// 先注销回调再关连接：AfterFunc 触发时会关连接，这里再关一次是幂等的，
+	// 但若不注销，回调会一直挂到 ctx 生命周期结束。
+	if m.stopCancel != nil {
+		m.stopCancel()
+	}
 	if m.conn != nil {
 		_ = m.conn.Close()
 	}
@@ -72,15 +84,17 @@ func (m *mmtlsClient) transcriptHash() []byte {
 
 func (m *mmtlsClient) nextRecord() (record, error) {
 	for len(m.recq) == 0 {
+		if err := m.ctx.Err(); err != nil {
+			return record{}, err
+		}
 		recs, consumed := parseRecords(m.rxbuf)
 		if len(recs) > 0 {
 			m.recq = append(m.recq, recs...)
 			m.rxbuf = m.rxbuf[consumed:]
 			break
 		}
-		if m.timeout > 0 {
-			_ = m.conn.SetReadDeadline(time.Now().Add(m.timeout))
-		}
+		// 单次读的超时不能把外层的截止时间往后推，必须取两者更早的那个
+		_ = m.conn.SetReadDeadline(ioDeadline(m.ctx, m.timeout))
 		buf := make([]byte, 65536)
 		n, err := m.conn.Read(buf)
 		if err != nil {
@@ -97,9 +111,10 @@ func (m *mmtlsClient) nextRecord() (record, error) {
 }
 
 func (m *mmtlsClient) sendRaw(data []byte) error {
-	if m.timeout > 0 {
-		_ = m.conn.SetWriteDeadline(time.Now().Add(m.timeout))
+	if err := m.ctx.Err(); err != nil {
+		return err
 	}
+	_ = m.conn.SetWriteDeadline(ioDeadline(m.ctx, m.timeout))
 	_, err := m.conn.Write(data)
 	return err
 }
@@ -326,10 +341,12 @@ func connectMmtls(ctx context.Context, target Target, timeout time.Duration, tcp
 	if err != nil {
 		return nil, err
 	}
-	mc := newMmtlsClient(conn, timeout)
+	mc := newMmtlsClient(ctx, conn, timeout)
 	if err = mc.doHandshake(); err != nil {
 		mc.close()
-		return nil, err
+		// 带上端点，并明确这是握手阶段失败——与建连失败区分开，
+		// 排查时才能判断是「连不上」还是「连上了但握手被拒」
+		return nil, fmt.Errorf("LongLink handshake to %s failed: %w", net.JoinHostPort(target.IP, strconv.Itoa(target.Port)), err)
 	}
 	return mc, nil
 }

@@ -6,449 +6,259 @@
   <meta name="description" content="yybwechat — 自托管微信扫码登录服务控制台">
   <title>yybwechat 控制台</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/css/console.css">
+  <link rel="stylesheet" href="/static/css/console.css?v=20261030-ui3">
+  <link rel="stylesheet" href="/static/css/platform.css?v=20261030-ui3">
   <style>
-    /* ---- layout ---- */
-    .app { min-height: 100vh; display: flex; flex-direction: column; }
+    /* 页面专属：账号表列宽、行内操作、悬停详情卡。
+       颜色 / 圆角 / 阴影一律走 console.css 的 token，这里不写死任何色值。 */
 
-    .topbar {
-      height: var(--topbar-h);
-      display: flex; align-items: center; justify-content: space-between; gap: 18px;
-      padding: 0 28px;
-      /* 顶部极浅的纵向渐变，给页面一个柔和的起手 */
-      background: linear-gradient(180deg, var(--bg), var(--bg-soft));
+    .accounts { width: 100%; min-width: 860px; }
+    .accounts thead th {
+      padding: 8px 12px; text-align: left; white-space: nowrap;
+      font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em;
+      text-transform: uppercase; color: var(--faint);
+      background: var(--surface-2); border-bottom: 1px solid var(--line);
+    }
+    .accounts thead th:first-child { padding-left: 16px; }
+    .accounts tbody td {
+      padding: 10px 12px; vertical-align: middle; white-space: nowrap;
       border-bottom: 1px solid var(--line);
-      position: sticky; top: 0; z-index: 10; backdrop-filter: blur(10px);
-      box-shadow: var(--shadow-sm);
     }
+    .accounts tbody td:first-child { padding-left: 16px; }
+    .accounts tbody tr { cursor: pointer; transition: background 100ms; }
+    .accounts tbody tr:hover { background: var(--surface-2); }
+    .accounts tbody tr[aria-selected="true"] { background: var(--primary-soft); }
+    .accounts tbody tr[aria-selected="true"] td:first-child { box-shadow: inset 3px 0 0 var(--primary); }
+    .accounts tbody tr:last-child td { border-bottom: 0; }
 
-    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .row-act { display: flex; gap: 2px; justify-content: flex-end; opacity: 0; transition: opacity 120ms; }
+    tr:hover .row-act, tr[aria-selected="true"] .row-act { opacity: 1; }
+    .row-act .icon-btn { width: 26px; height: 26px; }
+    .row-act .icon-btn svg { width: 14px; height: 14px; }
+    .row-act .icon-btn.dangerish:hover { background: var(--danger-soft); color: var(--danger); }
 
-    .shell { width: min(1440px, 100%); margin: 0 auto; padding: 22px 28px 32px; display: grid; gap: 18px; }
+    /* 双栏等高：结果区跟着左侧一起长，两栏底边对齐。
+       做法是把卡片与卡片体都变成竖向 flex，让 pre 吃掉剩下的高度。 */
+    .split { align-items: stretch; }
+    .split > .card { display: flex; flex-direction: column; }
+    .split > .card > .card-body { flex: 1; display: flex; flex-direction: column; gap: 13px; }
+    #resultBox { flex: 1; min-height: 214px; max-height: none; }
 
-    /* ---- overview ---- */
-    .overview { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: stretch; }
+    /* 渠道列：图标 + 文字。图标只有 14px，靠 align-items 与文字基线对齐，
+       加载失败时 alt 为空不会露出破图占位。 */
+    .chan { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
+    .chan-ico { width: 14px; height: 14px; flex: none; border-radius: 3px; object-fit: contain; }
 
-    .summary {
-      min-width: 0; background: var(--bg); border: 1px solid var(--line);
-      border-radius: var(--radius-lg); padding: 20px; display: grid; gap: 12px;
-      box-shadow: var(--shadow-sm);
-      /* 左上角一道极淡的品牌色高光，克制地提升层次 */
-      background-image: radial-gradient(120% 100% at 0% 0%, var(--primary-soft) 0%, transparent 42%);
+    .target {
+      display: flex; align-items: center; gap: 9px;
+      padding: 8px 10px; border-radius: var(--radius);
+      background: var(--surface-2); border: 1px solid var(--line);
     }
-    .summary h2 { margin: 0; font-size: 20px; font-weight: 760; text-wrap: balance; letter-spacing: -0.01em; }
-    .summary-copy { margin: 0; max-width: 72ch; color: var(--muted); }
+    .target .pill { margin-left: auto; }
 
-    .stat-row { display: flex; flex-wrap: wrap; gap: 8px; }
-    .stat-chip {
-      min-height: 32px; display: inline-flex; align-items: center; gap: 8px;
-      padding: 6px 10px; border-radius: 999px; background: var(--surface);
-      border: 1px solid var(--line); color: var(--muted);
+    details.advanced { border-top: 1px dashed var(--line); padding-top: 11px; }
+    details.advanced > summary {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 11.5px; color: var(--muted); cursor: pointer;
+      list-style: none; user-select: none;
     }
-    .stat-chip strong { color: var(--ink); font-weight: 760; }
+    details.advanced > summary::-webkit-details-marker { display: none; }
+    details.advanced > summary svg { width: 12px; height: 12px; transition: transform 150ms; }
+    details.advanced[open] > summary svg { transform: rotate(90deg); }
 
-    /* 三态图例：让 unknown 与 expired 的区别对用户可见 */
-    .status-legend { display: grid; gap: 5px; margin-top: 2px; }
-    .legend-item {
-      display: flex; align-items: center; gap: 8px;
-      color: var(--faint); font-size: 12px; line-height: 1.4;
-    }
-    .legend-item .status-dot { flex: 0 0 auto; }
-
-    /* 深色渐变操作面板：与浅色卡片形成对比，聚焦批量操作 */
-    .quick-actions {
-      min-width: 260px; background: var(--grad-panel); color: var(--bg);
-      border: 1px solid oklch(0.36 0.028 252); border-radius: var(--radius-lg);
-      padding: 18px; display: grid; align-content: space-between; gap: 14px;
-      box-shadow: var(--shadow-md);
-    }
-    .quick-actions p { margin: 0; color: var(--quick-ink); font-size: 13px; line-height: 1.6; }
-    .quick-actions .btn { background: var(--quick-bg); color: var(--quick-ink); border-color: oklch(0.36 0.028 252); }
-    .quick-actions .btn:hover { background: oklch(0.33 0.032 252); }
-
-    /* ---- account band ---- */
-    .account-band, .panel {
-      background: var(--bg); border: 1px solid var(--line);
-      border-radius: var(--radius-lg); box-shadow: var(--shadow-sm); overflow: hidden;
-    }
-
-    .section-head {
-      min-height: 58px; display: flex; align-items: center; justify-content: space-between;
-      gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--line);
-    }
-    .section-title { display: grid; gap: 2px; min-width: 0; }
-    .section-title h3 { margin: 0; font-size: 15px; font-weight: 760; }
-    .section-title p { margin: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-    .section-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-
-    .search-wrap { position: relative; }
-    .search-input {
-      height: 34px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
-      color: var(--ink); padding: 0 10px 0 32px; outline: none; width: 180px; transition: border-color 160ms ease, width 200ms ease;
-    }
-    .search-input:focus {
-      border-color: var(--accent); width: 220px;
-      box-shadow: 0 0 0 3px var(--accent-soft);
-    }
-    .search-icon {
-      position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
-      color: var(--faint); pointer-events: none; font-size: 14px;
-    }
-
-    .account-strip {
-      padding: 12px; display: grid; grid-auto-flow: column;
-      grid-auto-columns: minmax(238px, 280px); gap: 10px;
-      overflow-x: auto; overflow-y: visible; scrollbar-width: thin; min-height: 126px;
-      position: relative;
-    }
-
-    .account-card {
-      width: 100%; min-height: 100px; padding: 12px; border: 1px solid var(--line);
-      border-radius: var(--radius); background: var(--surface); color: var(--ink); text-align: left;
-      display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 10px; align-items: start;
-      transition: background 160ms ease, border-color 160ms ease, transform 120ms ease,
-                  box-shadow 160ms ease;
-    }
-    .account-card:hover {
-      background: var(--bg); border-color: var(--accent);
-      transform: translateY(-1px); box-shadow: var(--shadow-md);
-    }
-    .account-card.selected {
-      background: var(--accent-soft); border-color: var(--accent);
-      box-shadow: 0 0 0 1px var(--accent);
-    }
-
-    .account-card-actions {
-      display: flex; flex-direction: column; gap: 4px; opacity: 1;
-    }
-
-    .avatar {
-      width: 42px; height: 42px; border-radius: 50%; overflow: hidden; background: var(--surface-strong);
-      border: 1px solid var(--line); display: grid; place-items: center; color: var(--muted); font-weight: 760;
-    }
-    .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .account-main { min-width: 0; display: grid; gap: 6px; }
-    .account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 760; }
-    .account-remark { margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); font-size: 11px; font-weight: 500; vertical-align: middle; }
-    .account-status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
-    /* unknown（待确认）用警示色，区别于可用与需重扫 */
-    .account-status.unknown .status-dot { background: var(--warning); }
-    .account-meta { color: var(--faint); font-size: 12px; display: grid; gap: 2px; white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
-
-    /* 凭据剩余有效期：保活功能在界面上的可见入口 */
-    .credential-chip {
-      display: inline-flex; align-items: center; gap: 5px; padding: 1px 7px;
-      border-radius: 999px; border: 1px solid var(--line);
-      background: var(--surface); color: var(--muted); font-size: 11px; white-space: nowrap;
-    }
-    .credential-chip.soon { border-color: var(--warning-soft); background: var(--warning-soft); color: var(--warning); }
-    .credential-chip.gone { border-color: var(--danger-soft); background: var(--danger-soft); color: var(--danger); }
-
-    /* 账号双轨生命周期：上条是保活凭据（小时级），下条是扫码 30 天授权窗口。
-       两条曲线衰减速度差两个数量级，分开画才能同时看清「保活是否在跑」和「是否该重扫」。 */
-    .account-lifecycle {
-      grid-column: 1 / -1; min-width: 0; display: grid; gap: 7px;
-      padding-top: 9px; margin-top: 1px; border-top: 1px dashed var(--line);
-    }
-    .lifecycle-row {
-      display: grid; grid-template-columns: 58px minmax(40px, 1fr) 84px;
-      align-items: center; gap: 8px;
-      color: var(--muted); font-size: 12px; line-height: 1.3;
-    }
-    .lifecycle-label { white-space: nowrap; }
-    .lifecycle-track { height: 4px; overflow: hidden; border-radius: 999px; background: var(--surface-strong); }
-    .lifecycle-track span {
-      display: block; height: 100%; border-radius: inherit;
-      background: var(--lifecycle-color, var(--success));
-      transition: width 180ms ease, background-color 180ms ease;
-    }
-    .lifecycle-value {
-      min-width: 72px; text-align: right; color: var(--faint); white-space: nowrap;
-      font-variant-numeric: tabular-nums;
-    }
-    .lifecycle-row.warn .lifecycle-value { color: var(--warning); }
-    .lifecycle-row.expired .lifecycle-value { color: var(--danger); }
-    .lifecycle-note { color: var(--faint); font-size: 11px; }
-    .lifecycle-inactive { color: var(--muted); font-size: 12px; min-height: 64px; align-content: center; }
-    .lifecycle-rescan {
-      display: inline-flex; align-items: center; gap: 4px;
-      padding: 1px 7px; border-radius: 999px; font-size: 11px;
-      border: 1px solid var(--warning-soft); background: var(--warning-soft); color: var(--warning);
-      justify-self: start;
-    }
-
-    /* ---- account detail tooltip ---- */
+    /* 悬停详情卡：挂到 body 上，避免被卡片裁切 */
     .account-tooltip {
-      position: fixed; z-index: 100; pointer-events: none;
-      background: var(--ink); color: var(--bg); border-radius: var(--radius);
-      padding: 12px 15px; font-size: 12px; line-height: 1.65;
-      box-shadow: 0 4px 20px rgba(0,0,0,.22); min-width: 260px; max-width: 340px;
-      opacity: 0; transform: translateY(6px); transition: opacity 140ms ease, transform 140ms ease;
-      display: grid; gap: 6px;
+      position: fixed; z-index: 80; width: 300px;
+      padding: 10px 12px; border-radius: var(--radius-md);
+      background: var(--surface); border: 1px solid var(--line);
+      box-shadow: var(--shadow-lg); font-size: 11.5px; color: var(--muted);
+      opacity: 0; pointer-events: none; transition: opacity 120ms;
     }
-    .account-tooltip.visible { opacity: 1; transform: translateY(0); }
-    .account-tooltip .tt-row { display: flex; justify-content: space-between; gap: 12px; }
-    .account-tooltip .tt-key { color: oklch(0.68 0.02 252); }
-    .account-tooltip .tt-val { text-align: right; word-break: break-all; max-width: 200px; }
+    .account-tooltip.visible { opacity: 1; }
+    .tt-row { display: flex; gap: 10px; justify-content: space-between; padding: 2px 0; }
+    .tt-key { color: var(--faint); flex: none; }
+    .tt-val { text-align: right; overflow-wrap: anywhere; }
 
-    .skeleton-card { width: 100%; min-height: 100px; border-radius: var(--radius); }
+    .log-line { font-size: 11.5px; color: var(--faint); }
 
-
-    /* ---- work grid ---- */
-    .work-grid {
-      display: grid;
-      grid-template-columns: minmax(360px, 0.95fr) minmax(420px, 1.15fr) minmax(260px, 0.65fr);
-      gap: 18px; align-items: start;
+    @media (max-width: 720px) {
+      .accounts { min-width: 0; }
+      .accounts thead { display: none; }
+      .accounts tbody tr {
+        display: grid; grid-template-columns: minmax(0, 1fr) auto;
+        gap: 6px 10px; padding: 12px 14px; border-bottom: 1px solid var(--line);
+      }
+      .accounts tbody td { padding: 0; border: 0; white-space: normal; }
+      .accounts tbody td:first-child { grid-column: 1; padding-left: 0; }
+      .accounts tbody td.c-id, .accounts tbody td.c-channel { display: none; }
+      .accounts tbody td.c-status { grid-column: 2; grid-row: 1; align-self: center; }
+      .accounts tbody td.c-life { grid-column: 1 / -1; }
+      .accounts tbody td.c-check { grid-column: 1; }
+      .accounts tbody td.c-act { grid-column: 2; grid-row: 2; }
+      .row-act { opacity: 1; }
     }
-    .panel-body { padding: 16px; display: grid; gap: 14px; }
-    .form-grid { display: grid; gap: 14px; }
-
-    .selected-account {
-      min-height: 44px; border: 1px solid var(--line); border-radius: var(--radius);
-      background: var(--surface); padding: 10px 11px;
-      display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted);
-    }
-    .selected-account strong { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-    .result-panel .panel-body { gap: 10px; }
-
-    .result-box {
-      min-height: 360px; max-height: 560px; margin: 0; overflow: auto;
-      border-radius: var(--radius); background: var(--code-bg); color: var(--code-ink);
-      padding: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-      font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
-    }
-    .result-box.error { color: var(--danger); }
-
-    .quick-list { display: grid; gap: 8px; }
-    .quick-link {
-      border: 1px solid var(--line); border-radius: var(--radius); padding: 11px;
-      background: var(--surface); color: var(--ink); text-decoration: none; display: grid; gap: 2px;
-      transition: background 160ms ease, border-color 160ms ease,
-                  box-shadow 160ms ease, transform 120ms ease;
-    }
-    .quick-link:hover {
-      background: var(--bg); border-color: var(--accent);
-      box-shadow: var(--shadow-sm); transform: translateY(-1px);
-    }
-    .quick-link span { color: var(--muted); font-size: 12px; }
-
-    .webhook-section {
-      padding: 12px; border: 1px solid var(--line); border-radius: var(--radius);
-      background: var(--surface); display: grid; gap: 4px;
-    }
-    .webhook-header { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
-    .webhook-header span:first-child { font-weight: 680; font-size: 13px; }
-
-    .log-line {
-      padding: 10px 11px; border-radius: var(--radius); background: var(--surface);
-      border: 1px solid var(--line); color: var(--muted); font-size: 12px;
-    }
-
-    /* ---- responsive ---- */
-    @media (max-width: 1120px) {
-      .overview, .work-grid { grid-template-columns: 1fr; }
-      .quick-actions { min-width: 0; }
-    }
-
-    @media (max-width: 760px) {
-      .topbar { height: auto; flex-direction: column; align-items: flex-start; padding: 14px 16px; }
-      .top-actions { width: 100%; }
-      .top-actions .btn, .top-actions .status-pill { flex: 1; }
-      .shell { padding: 16px; }
-      .section-head { flex-direction: column; align-items: flex-start; }
-      .section-head-actions { width: 100%; }
-      .section-head-actions .btn { flex: 1; }
-      .search-input { width: 100%; }
-      .search-input:focus { width: 100%; }
-      .account-strip { grid-auto-columns: minmax(222px, 86vw); }
-      /* 窄屏下把时长列压窄，保证两条进度条仍有足够长度可读 */
-      .lifecycle-row { grid-template-columns: 52px minmax(32px, 1fr) 74px; gap: 6px; }
-      .account-lifecycle { gap: 6px; }
-    }
-
   </style>
 </head>
 <body>
-  <div class="app">
-    <!-- topbar -->
-    <header class="topbar">
-      <div class="brand">
-        <div class="mark" aria-hidden="true">Y</div>
-        <div>
-          <h1 class="brand-title">yybwechat 控制台</h1>
-          <div class="brand-subtitle">微信扫码登录 · 多账号管理 · 能力调用 · 凭据保活</div>
-        </div>
-      </div>
-      <div class="top-actions">
-        <span class="status-pill" id="healthPill"><span class="status-dot"></span><span>检测中</span></span>
-        <span class="status-pill" id="versionPill" title="服务版本">v—</span>
-        <span class="status-pill" id="userPill" title="当前管理员"><span id="userName">—</span></span>
-        <button class="btn ghost" id="themeToggle" title="切换主题" aria-label="切换深色/浅色模式">🌓</button>
-        <button class="btn secondary" id="changePwdBtn" title="修改登录密码">🔑</button>
-        <button class="btn secondary" id="logoutBtn" title="退出登录">退出</button>
-        <a class="btn secondary" href="/proxies">代理设置</a>
-        <a class="btn secondary" href="/docs/index.html">Swagger</a>
-        <a class="btn primary" href="/scan">➕ 扫码添加</a>
-      </div>
-    </header>
-
-    <main class="shell">
-      <!-- overview -->
-      <section class="overview" aria-label="概览">
-        <div class="summary">
-          <h2>选择账号，执行服务调用</h2>
-          <p class="summary-copy">点击账号卡片选中后，调用面板将使用该账号发起请求。接口文档请查看 Swagger。</p>
-          <div class="stat-row">
-            <span class="stat-chip">账号 <strong id="accountCount">—</strong></span>
-            <span class="stat-chip">可用 <strong id="aliveCount">—</strong></span>
-            <span class="stat-chip">待确认 <strong id="unknownCount">—</strong></span>
-            <span class="stat-chip">需重扫 <strong id="expiredCount">—</strong></span>
-            <span class="stat-chip">能力 <strong id="featureCount">—</strong></span>
-            <span class="stat-chip">当前 <strong id="currentAccountText">未选择</strong></span>
-          </div>
-          <div class="status-legend" aria-label="账号状态说明">
-            <span class="legend-item"><span class="status-dot" style="background:var(--success)"></span><b>可用</b>　凭据有效，可直接调用 wxapp 接口</span>
-            <span class="legend-item"><span class="status-dot" style="background:var(--warning)"></span><b>待确认</b>　本轮未能判定（网络抖动 / 超时），保留会话自动重试，<b>不算掉线、不发告警</b></span>
-            <span class="legend-item"><span class="status-dot" style="background:var(--danger)"></span><b>需重扫</b>　凭据已彻底失效，必须重新扫码</span>
-          </div>
-        </div>
-        <aside class="quick-actions">
-          <p>批量操作：刷新全部账号存活状态或同步最新资料，也可以整理账号 ID 与清理扫码残留。单个账号的备注与状态修正，请用卡片右上角的 ✎ 与 ⇄ 按钮。</p>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn" id="refreshAllBtn">刷新存活</button>
-            <button class="btn" id="resyncAllBtn">同步资料</button>
-            <button class="btn secondary" id="compactBtn" title="把账号 ID 重排为连续的 1、2、3…">整理 ID</button>
-            <button class="btn secondary" id="repairBtn" title="清理扫码中断留下的残缺账号">清理残留</button>
-          </div>
-        </aside>
-      </section>
-
-      <!-- account band -->
-      <section class="account-band" aria-label="账号队列">
-        <div class="section-head">
-          <div class="section-title">
-            <h3>账号队列</h3>
-            <p>点击选择账号，悬停显示操作按钮</p>
-          </div>
-          <div class="section-head-actions">
-            <span class="search-wrap">
-              <span class="search-icon">🔍</span>
-              <input class="search-input" id="searchInput" placeholder="搜索昵称 / openid…" autocomplete="off" spellcheck="false">
-            </span>
-            <button class="btn secondary" id="reloadAccountsBtn">重新加载</button>
-            <a class="btn primary" href="/scan">➕ 添加</a>
-          </div>
-        </div>
-        <div class="account-strip" id="accountStrip">
-          <div class="empty-state">账号加载中…</div>
-        </div>
-      </section>
-
-      <!-- work grid -->
-      <section class="work-grid" aria-label="调用工作区">
-        <!-- config panel -->
-        <section class="panel">
-          <div class="section-head">
-            <div class="section-title">
-              <h3>调用配置</h3>
-              <p>选择能力和目标小程序</p>
-            </div>
-          </div>
-          <div class="panel-body">
-            <div class="selected-account">
-              <span>当前账号</span>
-              <strong id="selectedAccountName">未选择</strong>
-            </div>
-            <div class="form-grid">
-              <div class="field">
-                <label for="featureSel">调用能力</label>
-                <select class="select" id="featureSel"></select>
-                <p class="field-hint" id="featureHint">选择能力后，这里会显示它的用途与所需参数。</p>
-              </div>
-              <!-- 小程序类能力需要 AppID；getUserInfo 不需要，标签会随能力切换 -->
-              <div class="field" id="appidGroup">
-                <label for="appidInput" id="appidLabel">小程序 APPID</label>
-                <input class="input" id="appidInput" value="wx141bfb9b73c970a9" autocomplete="off" spellcheck="false" placeholder="输入目标小程序 AppID">
-              </div>
-              <!-- 公众号网页授权：只生成授权链接，code 由用户授权后回调带回 -->
-              <div class="field hidden" id="oauthGroup">
-                <label for="redirectInput">授权回调地址</label>
-                <input class="input" id="redirectInput" autocomplete="off" spellcheck="false" placeholder="https://example.com/callback">
-                <label for="scopeSel">授权作用域</label>
-                <select class="select" id="scopeSel">
-                  <option value="snsapi_base">snsapi_base — 静默授权，仅获取 openid</option>
-                  <option value="snsapi_userinfo">snsapi_userinfo — 需用户确认，可获取用户信息</option>
-                </select>
-              </div>
-              <div class="field hidden" id="payloadGroup">
-                <label for="payloadInput">请求数据（JSON）</label>
-                <textarea class="textarea" id="payloadInput" spellcheck="false">{"api_name":"getUserInfo","data":{},"env":1}</textarea>
-              </div>
-            </div>
-            <div style="display:flex;gap:8px">
-              <button class="btn primary" id="callBtn">▶ 执行调用</button>
-              <button class="btn secondary" id="clearResultBtn">清空结果</button>
-            </div>
-          </div>
-        </section>
-
-        <!-- result panel -->
-        <section class="panel result-panel">
-          <div class="section-head">
-            <div class="section-title">
-              <h3>返回结果</h3>
-              <p id="resultMeta">等待调用</p>
-            </div>
-            <button class="btn secondary" id="copyResultBtn">复制</button>
-          </div>
-          <div class="panel-body">
-            <pre class="result-box" id="resultBox">选择账号并执行调用后，返回内容会显示在这里。</pre>
-          </div>
-        </section>
-
-        <!-- sidebar -->
-        <aside class="panel">
-          <div class="section-head">
-            <div class="section-title">
-              <h3>系统入口</h3>
-              <p>文档、接口与状态</p>
-            </div>
-          </div>
-          <div class="panel-body">
-            <div class="quick-list">
-              <a class="quick-link" href="/docs/index.html">
-                📖 Swagger 文档
-                <span>浏览完整 OpenAPI 接口</span>
-              </a>
-              <a class="quick-link" href="/openapi.json">
-                📋 OpenAPI JSON
-                <span>导入 Postman / Apifox</span>
-              </a>
-              <a class="quick-link" href="/scan">
-                📱 扫码页面
-                <span>添加新的微信账号</span>
-              </a>
-            </div>
-            <div class="webhook-section">
-              <div class="webhook-header">
-                <span>🔔 掉线通知</span>
-                <span class="status-dot" id="webhookDot" style="width:6px;height:6px;border-radius:50%;background:var(--faint)"></span>
-              </div>
-              <input class="input" id="webhookInput" placeholder="https://your-webhook.example.com" autocomplete="off" spellcheck="false" style="height:34px;font-size:13px">
-              <div style="display:flex;gap:6px">
-                <button class="btn secondary" id="saveWebhookBtn" style="flex:1">保存</button>
-                <button class="btn secondary" id="testWebhookBtn" style="flex:1">测试</button>
-              </div>
-              <div id="webhookHint" style="color:var(--faint);font-size:12px;margin-top:2px">状态在「可用 ↔ 需重扫」之间变化时推送；「待确认」不推送，避免网络抖动误报</div>
-            </div>
-            <div class="log-line" id="activityLine">就绪</div>
-          </div>
-        </aside>
-      </section>
-    </main>
+  <!-- 顶栏按钮：由 platform.js 整体搬进外壳顶栏，id 与事件绑定不变 -->
+  <div class="top-actions" id="pageActions">
+    <span class="status-pill" id="healthPill"><span class="status-dot"></span><span>检测中</span></span>
+    <button class="icon-btn" id="changePwdBtn" title="修改登录密码" aria-label="修改登录密码"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M17 12v3M20 12v2"/></svg></button>
+    <a class="btn primary" href="/scan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg>扫码添加</a>
   </div>
+
+  <main>
+    <div class="page">
+      <!-- 页面标题由外壳顶栏提供（整页唯一的 h1），这里只放一句话说明 -->
+      <div class="page-head">
+        <p>点击账号行选中，再选择能力发起一次协议调用；概览数字在每轮保活后更新。</p>
+        <div class="head-actions">
+          <button class="btn" id="refreshAllBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4.5h-4.5"/></svg>刷新存活</button>
+          <button class="btn" id="resyncAllBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.4-5.9M20 12a8 8 0 0 1-13.4 5.9"/><path d="M17.5 3.5V7H14M6.5 20.5V17H10"/></svg>同步资料</button>
+          <button class="btn" id="compactBtn" title="把账号 ID 重排为连续的 1、2、3…">整理 ID</button>
+          <button class="btn" id="repairBtn" title="清理扫码中断留下的残缺账号">清理残留</button>
+          <button class="btn" id="mergeBtn" title="把误建账号的授权移入原账号，保留原 ID 的配置">合并账号</button>
+        </div>
+      </div>
+
+      <!-- 概览：五个数字说清「这个服务现在是什么状态」 -->
+      <section class="kpis" aria-label="概览">
+        <div class="kpi"><small>账号总数</small><strong class="num" id="accountCount">—</strong><span class="sub">含全部渠道</span></div>
+        <div class="kpi ok"><small>可用</small><strong class="num" id="aliveCount">—</strong><span class="sub">可直接调用</span></div>
+        <div class="kpi warn"><small>待确认</small><strong class="num" id="unknownCount">—</strong><span class="sub">网络抖动，稍后重试</span></div>
+        <div class="kpi bad"><small>需重扫</small><strong class="num" id="expiredCount">—</strong><span class="sub">凭据已失效</span></div>
+        <div class="kpi accent"><small>能力</small><strong class="num" id="featureCount">—</strong><span class="sub">含网页授权</span></div>
+      </section>
+
+      <!-- 账号：从卡片流改成表格，一行一个号，操作悬停才出现 -->
+      <section class="card">
+        <div class="card-head">
+          <h2>账号</h2>
+          <span class="hint">点击行选中，悬停显示操作</span>
+          <div class="right">
+            <label class="search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+              <input id="searchInput" type="search" placeholder="搜索昵称 / openid" autocomplete="off" spellcheck="false">
+            </label>
+            <button class="btn sm" id="reloadAccountsBtn">重新加载</button>
+            <a class="btn sm primary" href="/scan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg>添加</a>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="accounts">
+            <thead>
+              <tr>
+                <th>账号</th><th class="c-id">ID</th><th class="c-channel">渠道</th>
+                <th class="c-status">状态</th><th class="c-life">生命周期</th>
+                <th class="c-check">最近检测</th><th aria-label="操作"></th>
+              </tr>
+            </thead>
+            <tbody id="accountRows"></tbody>
+          </table>
+          <div class="empty-state" id="accountEmpty">账号加载中…</div>
+        </div>
+      </section>
+
+      <!-- 调用工作区：左边配置，右边结果 -->
+      <section class="split">
+        <div class="card">
+          <div class="card-head">
+            <h2>调用配置</h2>
+            <span class="hint">选中账号后发起一次调用</span>
+          </div>
+          <div class="card-body">
+            <div class="target">
+              <span class="avatar" id="targetAvatar">—</span>
+              <span class="who-copy">
+                <strong id="selectedAccountName">未选择</strong>
+                <small id="currentAccountText">未选择</small>
+              </span>
+              <span class="pill ok" id="targetPill"><i></i>未选择</span>
+            </div>
+
+            <div class="field">
+              <label for="featureSel">调用能力</label>
+              <select class="select" id="featureSel"></select>
+              <span class="field-hint" id="featureHint">选择能力后，这里会显示它的用途与所需参数。</span>
+            </div>
+
+            <div class="field" id="appidGroup">
+              <label for="appidInput" id="appidLabel">小程序 APPID</label>
+              <input class="input mono" id="appidInput" value="wx141bfb9b73c970a9" autocomplete="off" spellcheck="false" placeholder="输入目标小程序 AppID">
+            </div>
+
+            <div class="field hidden" id="oauthGroup">
+              <label for="redirectInput">授权回调地址</label>
+              <input class="input" id="redirectInput" autocomplete="off" spellcheck="false" placeholder="https://example.com/callback">
+              <label for="scopeSel">授权作用域</label>
+              <select class="select" id="scopeSel">
+                <option value="snsapi_base">snsapi_base — 静默授权，仅获取 openid</option>
+                <option value="snsapi_userinfo">snsapi_userinfo — 需用户确认，可获取用户信息</option>
+              </select>
+            </div>
+
+            <div class="field hidden" id="payloadGroup">
+              <label for="payloadInput">请求数据（JSON）</label>
+              <textarea class="textarea" id="payloadInput" spellcheck="false">{"api_name":"getUserInfo","data":{},"env":1}</textarea>
+            </div>
+
+            <div style="display:flex;gap:8px">
+              <button class="btn primary" id="callBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5.2v13.6L19 12z"/></svg>执行调用</button>
+              <button class="btn" id="clearResultBtn">清空结果</button>
+            </div>
+
+            <!-- 测试命令：把「同一个构造器」生成的请求原样变成可复制命令，
+                 命令跟随当前账号、渠道与参数，避免文档示例与实际请求不一致。 -->
+            <details class="advanced" id="testCommand">
+              <summary><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>测试命令</summary>
+              <div style="display:flex;gap:7px;align-items:center;margin-top:10px">
+                <select class="select" id="commandShell" style="width:auto"><option value="bash">cURL · Bash</option><option value="pwsh">PowerShell</option></select>
+                <button class="btn sm" id="copyCommandBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.4"/><path d="M15.5 5.5h-9a2 2 0 0 0-2 2v9"/></svg>复制</button>
+              </div>
+              <pre class="code" id="commandPreview" tabindex="0" style="margin-top:9px;max-height:180px"></pre>
+              <span class="field-hint">已配置协议令牌时，请先设置环境变量 <code>YYB_PROTOCOL_TOKEN</code>；此处不会写入页面中填写的令牌。</span>
+            </details>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>返回结果</h2>
+            <div class="right" id="resultMeta"><span class="badge">等待调用</span></div>
+            <button class="icon-btn" id="copyResultBtn" title="复制结果" aria-label="复制结果"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8.5" y="8.5" width="11" height="11" rx="2.4"/><path d="M15.5 5.5h-9a2 2 0 0 0-2 2v9"/></svg></button>
+          </div>
+          <div class="card-body">
+            <pre class="code" id="resultBox">选择账号并执行调用后，返回内容会显示在这里。</pre>
+            <div class="notice">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2.5 4.5 14H11l-1 7.5L19.5 10H13z"/></svg>
+              <span>同一能力在「测试命令」里会生成等价的 cURL —— 命令与页面用的是同一套参数构造，不会出现文档与实际请求不一致。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 通知与活动：次要信息，收在最后 -->
+      <section class="card">
+        <div class="card-head">
+          <h2>掉线通知</h2>
+          <span class="hint">状态在「可用 ↔ 需重扫」之间变化时推送</span>
+          <div class="right"><span class="status-dot" id="webhookDot" style="background:var(--faint)"></span></div>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <label for="webhookInput">Webhook 地址</label>
+            <div style="display:flex;gap:8px">
+              <input class="input mono" id="webhookInput" placeholder="https://your-webhook.example.com" autocomplete="off" spellcheck="false">
+              <button class="btn" id="saveWebhookBtn">保存</button>
+              <button class="btn" id="testWebhookBtn">测试</button>
+            </div>
+            <span class="field-hint" id="webhookHint">「待确认」不推送，避免网络抖动误报。</span>
+          </div>
+          <div class="log-line" id="activityLine">就绪</div>
+        </div>
+      </section>
+    </div>
+  </main>
 
   <!-- toast container -->
   <div class="toast-container" id="toastContainer"></div>
@@ -541,7 +351,8 @@
       state.lastResult = text;
       $("resultBox").textContent = text;
       $("resultBox").classList.toggle("error", Boolean(isError));
-      $("resultMeta").textContent = meta || "已更新";
+      // resultMeta 里放的是一枚 badge，直接写 textContent 会把样式冲掉
+      $("resultMeta").innerHTML = `<span class="badge ${isError ? "bad" : ""}">${escapeHTML(meta || "已更新")}</span>`;
     }
 
     /* ========== API 调用 ========== */
@@ -574,8 +385,16 @@
 
     /* ========== 账号相关 ========== */
     function accountName(acc) { return acc.nickname || acc.alias || acc.openid || "未命名"; }
-    function statusText(s) { return s === "alive" ? "可用" : s === "expired" ? "需重扫" : "待确认"; }
-    function statusClass(s) { return s === "alive" ? "alive" : s === "expired" ? "expired" : "unknown"; }
+    function statusText(s) {
+      // session_only 单独给一个文案：它不是「待确认」（还在自愈），
+      // 也不是「需重扫」（会话彻底没了）——授权已被拒，但原会话还能试。
+      if (s === "session_only") return "需补授权";
+      return s === "alive" ? "可用" : s === "expired" ? "需重扫" : "待确认";
+    }
+    function statusClass(s) {
+      if (s === "session_only") return "session-only";
+      return s === "alive" ? "alive" : s === "expired" ? "expired" : "unknown";
+    }
     function formatChecked(ts) {
       if (!ts) return "未检测";
       const d = new Date(ts * 1000);
@@ -600,9 +419,20 @@
       const label = sel ? accountName(sel) : "未选择";
       $("selectedAccountName").textContent = label;
       $("currentAccountText").textContent = label;
-      document.querySelectorAll(".account-card").forEach(c => {
-        c.classList.toggle("selected", c.dataset.openid === state.selectedOpenID);
+      document.querySelectorAll("#accountRows tr").forEach(r => {
+        r.setAttribute("aria-selected", String(r.dataset.openid === state.selectedOpenID));
       });
+      const pill = $("targetPill");
+      if (pill) {
+        const cls = sel ? statusClass(sel.status) : "";
+        pill.className = "pill " + ({ alive: "ok", expired: "bad", unknown: "warn", "session-only": "warn" }[cls] || "");
+        pill.innerHTML = `<i></i>${sel ? statusText(sel.status) : "未选择"}`;
+      }
+      const avatar = $("targetAvatar");
+      if (avatar) avatar.textContent = sel ? (accountName(sel).slice(0, 1).toUpperCase() || "Y") : "—";
+      // 选中账号会改变 openid、channel 与默认参数，命令预览必须跟着重算，
+      // 否则复制出去的命令指向的是上一个账号。updateTestCommand 自带元素缺失保护。
+      updateTestCommand();
     }
 
     function renderStats() {
@@ -610,7 +440,9 @@
       $("accountCount").textContent = String(state.accounts.length);
       $("aliveCount").textContent = String(by("alive"));
       $("unknownCount").textContent = String(by("unknown"));
-      $("expiredCount").textContent = String(by("expired"));
+      // session_only 也计入「需重扫」：它确实需要重新扫码，只是会话还留着。
+      // 不合并的话这三个数加起来会小于账号总数，看上去像丢了账号。
+      $("expiredCount").textContent = String(by("expired") + by("session_only"));
       $("featureCount").textContent = String(state.features.length);
       syncSelectedAccount();
     }
@@ -629,6 +461,16 @@
     }
 
     // 把秒数折成「X天Y小时」这类中文时长，用于扫码窗口与凭据剩余展示。
+    // 行内操作图标：统一内联 SVG，不用 emoji（各系统字形与基线不可控）
+    const ROW_ICON = {
+      remark: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="M14.5 5.5 18.5 9.5"/>',
+      status: '<path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2.2"/><circle cx="9" cy="16" r="2.2"/>',
+      proxy: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.3 3.6 5.2 3.6 8.5S14.4 18.2 12 20.5c-2.4-2.3-3.6-5.2-3.6-8.5S9.6 5.8 12 3.5z"/>',
+      link: '<path d="M10.5 13.5a4.5 4.5 0 0 0 6.4.1l1.8-1.8a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M13.5 10.5a4.5 4.5 0 0 0-6.4-.1l-1.8 1.8a4.5 4.5 0 0 0 6.4 6.4l1-1"/>',
+      del: '<path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/>'
+    };
+    const rowIcon = name => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ROW_ICON[name] || "") + '</svg>';
+
     function lifecycleDuration(seconds) {
       if (!Number.isFinite(seconds)) return "未记录";
       if (seconds <= 0) return "已到期";
@@ -641,104 +483,118 @@
       return `${minutes}分钟`;
     }
 
-    // 进度条颜色随剩余比例连续过渡：归零为红，过半转黄，充裕为绿。
-    function lifecycleColor(ratio) {
-      const value = Math.max(0, Math.min(1, Number(ratio) || 0));
-      const hue = 8 + value * 112;
-      return `hsl(${Math.round(hue)} 78% 42%)`;
-    }
-
-    // 账号生命周期双进度条。
-    // 保活凭据只有两小时量级，扫码窗口是 30 天；两者混在一个数字里会互相淹没，
-    // 所以拆成两行独立衰减，并在 25 天处提示需要重新扫码。
+    // 账号生命周期：两条细进度条，宽度与配色由 CSS 负责，
+    // 这里只给比例与文案——颜色不再由 JS 拼 hsl（深浅色下都不可控）。
     function lifecycleMarkup(account) {
-      if (account.status === "expired") {
-        return '<span class="account-lifecycle lifecycle-inactive">保活已停止 · 重新扫码后恢复</span>';
+      const warnIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 4.5 21 19.5H3z"/><path d="M12 10v4M12 17h.01"/></svg>';
+      if (account.status === "session_only") {
+        return `<span class="life-dead">${warnIcon}授权已失效 · 仅尝试原会话，请重新扫码</span>`;
       }
+      if (account.status === "expired") {
+        return `<span class="life-dead">${warnIcon}凭据已失效 · 需重新扫码</span>`;
+      }
+      const row = (label, ratio, cls, value) =>
+        `<span class="life-row ${cls}"><em>${label}</em><span class="life-track"><span style="width:${Math.max(0, Math.min(100, Number(ratio) || 0)).toFixed(1)}%"></span></span><span class="life-value">${value}</span></span>`;
       const now = Math.floor(Date.now() / 1000);
+      // 电脑管家是另一套语义：凭据靠本机原生续期计划滚动，没有「扫码 30 天」窗口，
+      // 所以只画一条「下次续期」，避免把计划时间当成服务端真实有效期。
+      if (account.scan_product === "pcmgr") {
+        const due = Number(account.credential_expires_at || 0);
+        const remaining = due ? Math.max(0, due - now) : 0;
+        const interval = Number(account.credential_expires_in || 86400) || 86400;
+        const ratio = due ? remaining / interval * 100 : 0;
+        const cls = !due ? "" : remaining <= 0 ? "bad" : remaining < 15 * 60 ? "warn" : "";
+        const value = due ? (remaining ? lifecycleDuration(remaining) : "待续期") : "未记录";
+        // 标签写「下次续期」而不是「续期」：条上是**还有多久去续**，
+        // 不是「凭据还能用多久」。管家凭据的真实有效期由微信侧决定，这里只是计划。
+        return `<span class="life" title="计划执行续期的时间，不代表服务端真实有效期">${row("下次续期", ratio, cls, value)}</span>`;
+      }
       const observed = Number(account.refresh_token_observed_at || 0);
       const scanWindow = 30 * 86400;
       const scanRemaining = observed ? Math.max(0, scanWindow - (now - observed)) : 0;
-      const scanRatio = observed ? Math.min(100, Math.max(0, scanRemaining / scanWindow * 100)) : 0;
+      const scanRatio = observed ? scanRemaining / scanWindow * 100 : 0;
       const expiresAt = Number(account.credential_expires_at || 0);
       const expiresIn = Number(account.credential_expires_in || 7200);
       const autoRemaining = expiresAt ? Math.max(0, expiresAt - now) : 0;
-      const autoRatio = expiresAt ? Math.min(100, Math.max(0, autoRemaining / expiresIn * 100)) : 0;
-      const scanClass = !observed || scanRemaining <= 0 ? "expired" : scanRemaining < 5 * 86400 ? "warn" : "";
-      const autoClass = !expiresAt || autoRemaining <= 0 ? "expired" : autoRemaining < 15 * 60 ? "warn" : "";
-      const rescanHint = account.rescan_recommended
-        ? '<span class="lifecycle-rescan">⚠ 建议重新扫码</span>'
-        : "";
-      return `<span class="account-lifecycle" aria-label="账号有效期">
-        <span class="lifecycle-row ${autoClass}"><span class="lifecycle-label">保活凭据</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(autoRatio / 100)};width:${autoRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${expiresAt ? lifecycleDuration(autoRemaining) : "未记录"}</span></span>
-        <span class="lifecycle-row ${scanClass}"><span class="lifecycle-label">扫码 30天</span><span class="lifecycle-track"><span style="--lifecycle-color:${lifecycleColor(scanRatio / 100)};width:${scanRatio.toFixed(1)}%"></span></span><span class="lifecycle-value">${observed ? lifecycleDuration(scanRemaining) : "未记录"}</span></span>
-        <span class="lifecycle-note">${observed ? `扫码于 ${formatChecked(observed)}` : "扫码时间未记录"}${expiresAt ? ` · 凭据到期 ${formatChecked(expiresAt)}` : ""}</span>
-        ${rescanHint}
+      const autoRatio = expiresAt ? autoRemaining / expiresIn * 100 : 0;
+      const scanClass = !observed || scanRemaining <= 0 ? "bad" : scanRemaining < 5 * 86400 ? "warn" : "";
+      const autoClass = !expiresAt || autoRemaining <= 0 ? "bad" : autoRemaining < 15 * 60 ? "warn" : "";
+      const extra = account.rescan_recommended ? '<span class="tag" style="color:var(--danger);border-color:var(--danger-soft);background:var(--danger-soft)">建议重扫</span>' : "";
+      return `<span class="life" aria-label="账号有效期">
+        ${row("保活", autoRatio, autoClass, expiresAt ? lifecycleDuration(autoRemaining) : "未记录")}
+        ${row("扫码", scanRatio, scanClass, observed ? lifecycleDuration(scanRemaining) : "未记录")}
+        ${extra}
       </span>`;
     }
 
     function renderAccounts() {
-      const strip = $("accountStrip");
+      const body = $("accountRows");
+      const empty = $("accountEmpty");
       const query = ($("searchInput").value || "").trim().toLowerCase();
 
       // 清理 body 中上次渲染遗留的 tooltip（fixed 定位挂载在 body 上）
       document.querySelectorAll(".account-tooltip").forEach(t => t.remove());
 
       if (!state.accounts.length) {
-        strip.innerHTML = `<div class="empty-state"><div class="empty-state-inner"><span class="empty-state-icon">📭</span>暂无账号<a href="/scan" class="btn primary" style="margin-top:4px">➕ 扫码添加</a></div></div>`;
+        body.innerHTML = "";
+        empty.hidden = false;
+        empty.innerHTML = `<div class="empty-state-inner">暂无账号<a href="/scan" class="btn primary">扫码添加</a></div>`;
         state.selectedOpenID = "";
         renderStats();
         return;
       }
+      empty.hidden = true;
 
       if (!state.accounts.some(a => a.openid === state.selectedOpenID)) {
         state.selectedOpenID = state.accounts[0].openid;
       }
 
-      strip.innerHTML = "";
-      state.accounts.forEach((account, i) => {
+      body.innerHTML = "";
+      state.accounts.forEach(account => {
         const name = accountName(account);
-        const cls = statusClass(account.status);
+        const pillClass = { alive: "ok", expired: "bad", unknown: "warn", "session-only": "warn" }[statusClass(account.status)] || "warn";
+        const product = account.scan_product === "pcmgr" ? "PCMgr" : "YYB";
+        const sub = account.remark || (account.uin ? "uin " + account.uin : (account.alias || "—"));
 
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "account-card";
-        button.style.animation = `cardIn 0.35s ease-out ${i * 0.04}s both`;
-        button.dataset.openid = account.openid;
-
+        const row = document.createElement("tr");
+        row.dataset.openid = account.openid;
+        row.setAttribute("aria-selected", String(account.openid === state.selectedOpenID));
         if (query && !name.toLowerCase().includes(query) && !(account.openid || "").toLowerCase().includes(query)) {
-          button.classList.add("hidden");
+          row.hidden = true;
         }
 
-        button.innerHTML = `
-          <span class="avatar">
-            <img alt="" src="/accounts/avatar?ref=${encodeURIComponent(account.openid)}" loading="lazy">
-            <span class="avatar-letter hidden">${escapeHTML(name.slice(0, 1).toUpperCase() || "Y")}</span>
-          </span>
-          <span class="account-main">
-            <span class="account-name">${escapeHTML(name)}${account.remark ? `<span class="account-remark">${escapeHTML(account.remark)}</span>` : ""}</span>
-            <span class="account-status ${cls}"><span class="status-dot"></span>${statusText(account.status)}</span>
-            <span class="account-meta">
-              <span>ID: ${escapeHTML(String(account.id ?? "-"))}</span>
-              <span>uin: ${escapeHTML(account.uin ?? "-")}</span>
-              <span>设备: ${escapeHTML(account.device_id ?? "—")}</span>
-              <span>检测: ${formatChecked(account.last_checked_at)}</span>
+        row.innerHTML = `
+          <td>
+            <span class="who">
+              <span class="avatar">
+                <img alt="" src="/accounts/avatar?ref=${encodeURIComponent(account.openid)}" loading="lazy">
+                <span class="avatar-letter hidden">${escapeHTML(name.slice(0, 1).toUpperCase() || "Y")}</span>
+              </span>
+              <span class="who-copy"><strong>${escapeHTML(name)}</strong><small>${escapeHTML(String(sub))}</small></span>
             </span>
-          </span>
-          <span class="account-card-actions">
-            <button class="btn ghost remark-account-btn" data-openid="${escapeHTML(account.openid)}" data-remark="${escapeHTML(account.remark || "")}" title="设置备注" aria-label="设置 ${escapeHTML(name)} 的备注">✎</button>
-            <button class="btn ghost status-account-btn" data-openid="${escapeHTML(account.openid)}" data-status="${escapeHTML(account.status || "")}" data-name="${escapeHTML(name)}" title="手动修正状态" aria-label="修正 ${escapeHTML(name)} 的状态">⇄</button>
-            <button class="btn ghost proxy-account-btn" data-id="${escapeHTML(String(account.id ?? ""))}" data-openid="${escapeHTML(account.openid)}" title="管理代理" aria-label="管理 ${escapeHTML(name)} 的代理">🌐</button>
-            <button class="btn ghost danger delete-account-btn" data-openid="${escapeHTML(account.openid)}" data-name="${escapeHTML(name)}" title="删除账号" aria-label="删除 ${escapeHTML(name)}">🗑</button>
-          </span>
-          ${lifecycleMarkup(account)}`;
+          </td>
+          <td class="c-id num">${escapeHTML(String(account.id ?? "-"))}</td>
+          <td class="c-channel"><span class="chan"><img class="chan-ico" alt="" src="/static/images/scan-${account.scan_product === "pcmgr" ? "pcmgr" : "yyb"}.png" loading="lazy">${product}</span></td>
+          <td class="c-status"><span class="pill ${pillClass}"><i></i>${statusText(account.status)}</span></td>
+          <td class="c-life">${lifecycleMarkup(account)}</td>
+          <td class="c-check">${formatChecked(account.last_checked_at)}</td>
+          <td class="c-act">
+            <span class="row-act">
+              <button class="icon-btn remark-account-btn" data-openid="${escapeHTML(account.openid)}" data-remark="${escapeHTML(account.remark || "")}" title="设置备注" aria-label="设置 ${escapeHTML(name)} 的备注">${rowIcon("remark")}</button>
+              <button class="icon-btn status-account-btn" data-openid="${escapeHTML(account.openid)}" data-status="${escapeHTML(account.status || "")}" data-name="${escapeHTML(name)}" title="手动修正状态" aria-label="修正 ${escapeHTML(name)} 的状态">${rowIcon("status")}</button>
+              <button class="icon-btn proxy-account-btn" data-id="${escapeHTML(String(account.id ?? ""))}" data-openid="${escapeHTML(account.openid)}" title="管理代理" aria-label="管理 ${escapeHTML(name)} 的代理">${rowIcon("proxy")}</button>
+              <button class="icon-btn link-account-btn" data-openid="${escapeHTML(account.openid)}" title="生成更新链接（一次性扫码）" aria-label="生成 ${escapeHTML(name)} 的更新链接">${rowIcon("link")}</button>
+              <button class="icon-btn dangerish delete-account-btn" data-openid="${escapeHTML(account.openid)}" data-name="${escapeHTML(name)}" title="删除账号" aria-label="删除 ${escapeHTML(name)}">${rowIcon("del")}</button>
+            </span>
+          </td>`;
 
-        // hover tooltip — show all account details (fixed + body-mounted to avoid overflow clipping)
+        // hover tooltip — 完整账号信息（挂到 body 上，避免被卡片裁切）
         const tooltip = document.createElement("div");
         tooltip.className = "account-tooltip";
         tooltip.innerHTML = [
           ["ID", account.id],
           ["openid", account.openid],
+          ["扫码渠道", account.scan_product === "pcmgr" ? "腾讯电脑管家 (PCMgr)" : "应用宝 (YYB)"],
           ["昵称", name],
           ["别名", account.alias || "—"],
           ["备注", account.remark || "—"],
@@ -760,13 +616,11 @@
         document.body.appendChild(tooltip);
 
         function positionTooltip() {
-          const rect = button.getBoundingClientRect();
-          const vw = window.innerWidth;
-          const vh = window.innerHeight;
+          const rect = row.getBoundingClientRect();
+          const vw = window.innerWidth, vh = window.innerHeight;
           const ttWidth = Math.min(340, Math.max(260, tooltip.offsetWidth || 260));
           const ttHeight = tooltip.offsetHeight || 200;
-          let left = rect.left;
-          let top = rect.bottom + 6;
+          let left = rect.left, top = rect.bottom + 6;
           if (left + ttWidth + 12 > vw) left = Math.max(8, vw - ttWidth - 12);
           if (top + ttHeight + 12 > vh) top = Math.max(8, rect.top - ttHeight - 6);
           tooltip.style.left = left + "px";
@@ -774,14 +628,14 @@
         }
 
         let hideOnScroll;
-        button.addEventListener("mouseenter", () => {
+        row.addEventListener("mouseenter", () => {
           positionTooltip();
           tooltip.classList.add("visible");
           hideOnScroll = () => tooltip.classList.remove("visible");
           window.addEventListener("scroll", hideOnScroll, { passive: true });
           window.addEventListener("resize", hideOnScroll, { passive: true });
         });
-        button.addEventListener("mouseleave", () => {
+        row.addEventListener("mouseleave", () => {
           tooltip.classList.remove("visible");
           if (hideOnScroll) {
             window.removeEventListener("scroll", hideOnScroll);
@@ -790,39 +644,36 @@
           }
         });
 
-        // avatar fallback
-        const img = button.querySelector("img");
+        // 头像加载失败时用首字母兜底
+        const img = row.querySelector("img");
         img.addEventListener("error", () => {
           img.classList.add("hidden");
-          button.querySelector(".avatar-letter").classList.remove("hidden");
+          row.querySelector(".avatar-letter").classList.remove("hidden");
         });
 
-        // 备注编辑
-        button.querySelector(".remark-account-btn").addEventListener("click", (e) => {
+        row.querySelector(".remark-account-btn").addEventListener("click", (e) => {
           e.stopPropagation();
           editRemark(e.currentTarget.dataset.openid, e.currentTarget.dataset.remark || "");
         });
 
-        // select account
-        button.addEventListener("click", (e) => {
+        row.addEventListener("click", (e) => {
           if (e.target.closest(".delete-account-btn")) return;
           if (e.target.closest(".remark-account-btn")) return;
           if (e.target.closest(".status-account-btn")) return;
           if (e.target.closest(".proxy-account-btn")) return;
+          if (e.target.closest(".link-account-btn")) return;
           state.selectedOpenID = account.openid;
           syncSelectedAccount();
           setActivity(`已选择：${name}`);
         });
 
-        // 跳转到该账号的代理设置页
-        button.querySelector(".proxy-account-btn").addEventListener("click", (e) => {
+        row.querySelector(".proxy-account-btn").addEventListener("click", (e) => {
           e.stopPropagation();
           const ref = e.currentTarget.dataset.id || e.currentTarget.dataset.openid || "";
           location.href = `/proxies?ref=${encodeURIComponent(ref)}`;
         });
 
-        // 手动修正账号状态
-        button.querySelector(".status-account-btn").addEventListener("click", (e) => {
+        row.querySelector(".status-account-btn").addEventListener("click", (e) => {
           e.stopPropagation();
           changeAccountStatus(
             e.currentTarget.dataset.openid,
@@ -831,21 +682,271 @@
           );
         });
 
-        // delete handler
-        button.querySelector(".delete-account-btn").addEventListener("click", (e) => {
+        row.querySelector(".link-account-btn").addEventListener("click", (e) => {
+          e.stopPropagation();
+          const target = state.accounts.find(a => a.openid === e.currentTarget.dataset.openid);
+          if (!target) { toast("账号已不存在，请刷新列表", "error"); return; }
+          openAccountLinkDialog(target);
+        });
+
+        row.querySelector(".delete-account-btn").addEventListener("click", (e) => {
           e.stopPropagation();
           const oid = e.currentTarget.dataset.openid;
           const n = e.currentTarget.dataset.name;
           showModal("删除账号", `确定删除「${n}」吗？此操作不可撤销。`, "确认删除", "danger", async () => {
             await api("DELETE", `/accounts?ref=${encodeURIComponent(oid)}`);
             toast(`「${n}」已删除`, "success");
-            await loadAccounts();
+            await loadAccounts({ background: true });
           });
         });
 
-        strip.appendChild(button);
+        body.appendChild(row);
       });
       renderStats();
+    }
+
+    /* ========== 更新链接（一次性扫码） ========== */
+    // 用途：不必把管理员口令交出去，也能让另一个人（或另一台手机）帮忙重扫。
+    //
+    // 三个必须讲清楚的点，都直接写在界面上：
+    //   1. 链接只能用一次，默认 10 分钟；
+    //   2. 更新类链接只接受原微信号扫码，换号扫不会改动任何东西；
+    //   3. 换渠道 = 换身份，必须先确认——两个渠道的凭据体系完全不同。
+    function channelLabel(product) {
+      return product === "pcmgr" ? "腾讯电脑管家" : "应用宝";
+    }
+
+    function openAccountLinkDialog(account) {
+      const source = account.scan_product === "pcmgr" ? "pcmgr" : "appstore";
+      const overlay = document.createElement("div");
+      overlay.className = "modal-overlay";
+      overlay.innerHTML = `
+        <div class="modal" style="max-width:520px">
+          <h4>生成更新链接 · ${escapeHTML(accountName(account))}</h4>
+          <p style="margin:6px 0 12px;color:var(--muted);font-size:12px;line-height:1.6">
+            链接只能用一次，生成后 10 分钟内有效。打开链接的人<b>不需要</b>登录控制台，
+            但必须用这个账号对应的微信扫码：换用其他微信号不会被接受，账号也不会被改动。
+          </p>
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">扫码渠道</label>
+          <select class="input" id="linkProduct" style="width:100%;margin-bottom:10px">
+            <option value="appstore">应用宝（YYB）</option>
+            <option value="pcmgr">腾讯电脑管家（PCMgr）</option>
+          </select>
+          <div id="linkSwitchWarn" class="hidden" style="margin-bottom:10px;padding:10px 12px;border-radius:8px;border:1px solid var(--warning-soft);background:var(--warning-soft);color:var(--warning);font-size:12px;line-height:1.6">
+            <b>这会切换账号渠道</b><br>
+            当前账号是「${escapeHTML(channelLabel(source))}」。改用「另一个渠道」扫码后，
+            账号 ID 保持不变，但 OpenID、凭据和登录会话会被整体替换，等于换成了另一个微信身份。
+            已配置的代理、备注与保活设置会保留。
+          </div>
+          <div id="linkResult" class="hidden" style="margin-bottom:10px">
+            <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">链接（复制给要扫码的人）</label>
+            <input class="input" id="linkURL" readonly style="width:100%;font-family:ui-monospace,monospace;font-size:12px">
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button class="btn secondary" id="linkCopy" type="button">复制链接</button>
+              <a class="btn secondary" id="linkOpen" target="_blank" rel="noopener">在新标签打开</a>
+            </div>
+            <div id="linkExisting" class="hidden" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+          </div>
+          <div class="modal-actions">
+            <button class="btn secondary cancel-btn" type="button">关闭</button>
+            <button class="btn primary create-btn" type="button">生成链接</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+
+      const select = overlay.querySelector("#linkProduct");
+      const warn = overlay.querySelector("#linkSwitchWarn");
+      const result = overlay.querySelector("#linkResult");
+      const createBtn = overlay.querySelector(".create-btn");
+      select.value = source;
+
+      const syncWarn = () => {
+        const switching = select.value !== source;
+        warn.classList.toggle("hidden", !switching);
+        // 已经生成过链接后换渠道，必须重新生成：链接里锁定的是签发时的渠道。
+        if (!result.classList.contains("hidden") && switching) {
+          result.classList.add("hidden");
+          createBtn.disabled = false;
+          createBtn.textContent = "重新生成";
+        }
+      };
+      select.addEventListener("change", syncWarn);
+      syncWarn();
+
+      const close = () => overlay.remove();
+      overlay.querySelector(".cancel-btn").addEventListener("click", close);
+      overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+
+      createBtn.addEventListener("click", async () => {
+        const product = select.value;
+        createBtn.disabled = true;
+        createBtn.classList.add("loading");
+        try {
+          const res = await api("POST", "/api/account-links", {
+            kind: "update",
+            ref: account.openid,
+            product,
+            confirm_switch: product !== source,
+          });
+          overlay.querySelector("#linkURL").value = res.url;
+          overlay.querySelector("#linkOpen").href = res.url;
+          result.classList.remove("hidden");
+          const box = overlay.querySelector("#linkExisting");
+          box.classList.add("hidden");
+          createBtn.textContent = "重新生成";
+          toast(res.switched ? `已生成切换渠道的更新链接` : "已生成更新链接", "success");
+        } catch (e) {
+          // 409 表示这个账号上已经有一条没用完的链接。把它列出来并提供作废，
+          // 否则运营者只能等到过期，期间完全不知道该用哪一条。
+          const data = e.data || {};
+          if (e.status === 409 && data.code === "active_link_exists") {
+            result.classList.remove("hidden");
+            const box = overlay.querySelector("#linkExisting");
+            box.classList.remove("hidden");
+            const rows = (data.existing || []).map(item => `
+              <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
+                <span style="flex:1">链接 ${item.id} · ${escapeHTML(channelLabel(item.product))} · 有效至 ${formatTime(item.expires_at)}</span>
+                <button class="btn secondary revoke-link" data-id="${item.id}" type="button">作废</button>
+              </div>`).join("");
+            box.innerHTML = `<div style="color:var(--warning)">该账号已有一条未使用的链接。可以先用完它，或作废后重新生成。</div>${rows}`;
+            overlay.querySelector("#linkURL").value = "";
+            createBtn.textContent = "重新生成";
+            box.querySelectorAll(".revoke-link").forEach(btn => {
+              btn.addEventListener("click", async () => {
+                btn.disabled = true;
+                try {
+                  await api("POST", `/api/account-links/${btn.dataset.id}/revoke`);
+                  toast("已作废旧链接", "success");
+                  await openAccountLinkDialogAfterRevoke(overlay, account);
+                } catch (err) { btn.disabled = false; toast(`作废失败: ${err.message}`, "error"); }
+              });
+            });
+          } else {
+            toast(e.message || "生成链接失败", "error");
+          }
+        } finally {
+          createBtn.disabled = false;
+          createBtn.classList.remove("loading");
+        }
+      });
+    }
+
+    // 作废旧链接后把对话框换新，避免用户停留在过期的按钮状态上。
+    async function openAccountLinkDialogAfterRevoke(overlay, account) {
+      overlay.remove();
+      openAccountLinkDialog(account);
+    }
+
+    /* ========== 合并账号 ========== */
+    // 场景：扫码时误建了一条新记录，而原记录带着完好的代理与备注。
+    // 直接「删旧建新」会连配置一起丢，所以提供「保留原 ID、只搬授权」的路子。
+    //
+    // 必须两步（预览 → 确认）：界面上很难一眼看准哪条是哪条，误合并会直接
+    // 丢掉一个 ID 和它的全部配置。预览指纹由后端按两份快照算出，确认时比对。
+    function accountOptionLabel(account) {
+      return `ID ${account.id} · ${accountName(account)} · ${channelLabel(account.scan_product)}`;
+    }
+
+    function openAccountMergeDialog() {
+      if (state.accounts.length < 2) {
+        toast("至少需要两个账号才能合并", "error");
+        return;
+      }
+      const options = state.accounts
+        .map(a => `<option value="${escapeHTML(a.openid)}">${escapeHTML(accountOptionLabel(a))}</option>`)
+        .join("");
+      const overlay = document.createElement("div");
+      overlay.className = "modal-overlay";
+      overlay.innerHTML = `
+        <div class="modal" style="max-width:520px">
+          <h4>合并账号</h4>
+          <p style="margin:6px 0 12px;color:var(--muted);font-size:12px;line-height:1.6">
+            把「来源账号」的授权移入「保留账号」，然后删除来源账号。<br>
+            <b>保留账号</b>的 ID、代理、备注和保活设置都不变；只有授权（OpenID / 凭据 / 会话）被替换。
+            外部脚本里硬编码了来源 ID 的地方需要自行调整。
+          </p>
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">来源账号（会被删除）</label>
+          <select class="input" id="mergeSource" style="width:100%;margin-bottom:10px">${options}</select>
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">保留账号</label>
+          <select class="input" id="mergeTarget" style="width:100%;margin-bottom:10px">${options}</select>
+          <div id="mergePreviewBox" class="hidden" style="margin-bottom:10px;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--surface);font-size:12px;line-height:1.7"></div>
+          <div class="modal-actions">
+            <button class="btn secondary cancel-btn" type="button">取消</button>
+            <button class="btn primary preview-btn" type="button">预览</button>
+            <button class="btn danger confirm-btn hidden" type="button">确认合并</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+
+      const sourceSel = overlay.querySelector("#mergeSource");
+      const targetSel = overlay.querySelector("#mergeTarget");
+      const previewBox = overlay.querySelector("#mergePreviewBox");
+      const previewBtn = overlay.querySelector(".preview-btn");
+      const confirmBtn = overlay.querySelector(".confirm-btn");
+      let previewKey = "";
+
+      // 默认把第二个账号选成保留账号，省去一次选择
+      targetSel.value = state.accounts[1].openid;
+
+      const resetPreview = () => {
+        previewKey = "";
+        previewBox.classList.add("hidden");
+        confirmBtn.classList.add("hidden");
+        previewBtn.classList.remove("hidden");
+      };
+      sourceSel.addEventListener("change", resetPreview);
+      targetSel.addEventListener("change", resetPreview);
+
+      const close = () => overlay.remove();
+      overlay.querySelector(".cancel-btn").addEventListener("click", close);
+      overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+
+      previewBtn.addEventListener("click", async () => {
+        if (sourceSel.value === targetSel.value) { toast("来源和保留账号不能相同", "error"); return; }
+        previewBtn.disabled = true;
+        try {
+          const res = await api("POST", "/accounts/merge", {
+            source_ref: sourceSel.value,
+            target_ref: targetSel.value,
+            confirm: false,
+          });
+          previewKey = res.preview_key;
+          const s = res.source, t = res.target;
+          previewBox.innerHTML = `
+            <div><b>来源</b>：ID ${s.id} · ${escapeHTML(accountName(res.source))} · ${escapeHTML(channelLabel(s.scan_product))} → <span style="color:var(--danger)">将被删除</span></div>
+            <div><b>保留</b>：ID ${t.id} · ${escapeHTML(accountName(t))} · ${escapeHTML(channelLabel(t.scan_product))} → 授权替换为来源的</div>
+            <div style="margin-top:6px;color:var(--muted)">${escapeHTML(res.note || "")}</div>`;
+          previewBox.classList.remove("hidden");
+          previewBtn.classList.add("hidden");
+          confirmBtn.classList.remove("hidden");
+        } catch (e) {
+          toast(e.message || "预览失败", "error");
+        } finally {
+          previewBtn.disabled = false;
+        }
+      });
+
+      confirmBtn.addEventListener("click", async () => {
+        if (!previewKey) { toast("请先预览", "error"); return; }
+        confirmBtn.disabled = true;
+        try {
+          const res = await api("POST", "/accounts/merge", {
+            source_ref: sourceSel.value,
+            target_ref: targetSel.value,
+            confirm: true,
+            preview_key: previewKey,
+          });
+          toast(`已合并到 ID ${res.account.id}，来源 ID ${res.removed_id} 已删除`, "success");
+          close();
+          await loadAccounts({ background: true });
+        } catch (e) {
+          // 授权在预览之后变了（保活刷新 / 别人重扫），要求重新预览而不是硬写
+          toast(e.message || "合并失败", "error");
+          resetPreview();
+        } finally {
+          confirmBtn.disabled = false;
+        }
+      });
     }
 
     /* ========== 账号备注 ========== */
@@ -857,7 +958,7 @@
         try {
           await api("POST", "/accounts/remark", { ref: openid, remark: next.trim() });
           toast("备注已保存", "success");
-          await loadAccounts();
+          await loadAccounts({ background: true });
         } catch (e) { toast(`备注保存失败: ${e.message}`, "error"); }
       })();
     }
@@ -873,9 +974,10 @@
           <div class="modal">
             <h4>修正「${escapeHTML(name)}」的状态</h4>
             <p>当前：<b>${escapeHTML(statusText(current))}</b>。手动设置会覆盖自动检测结果；标记为「需重扫」时会同时清理该账号的登录会话。</p>
+            ${current === "session_only" ? '<p class="notice">该账号的授权已被上游拒绝，<b>不能</b>手动改回「可用」——那样只会让卡片看起来正常，下一次调用立刻又被拒。请重新扫码。</p>' : ""}
             <div class="modal-actions">
               <button class="btn secondary cancel-btn">取消</button>
-              <button class="btn primary alive-btn">标记为可用</button>
+              ${current === "session_only" ? "" : '<button class="btn primary alive-btn">标记为可用</button>'}
               <button class="btn danger expired-btn">标记为需重扫</button>
             </div>
           </div>`;
@@ -884,7 +986,8 @@
         const close = value => { overlay.remove(); resolve(value); };
         overlay.querySelector(".cancel-btn").addEventListener("click", () => close(null));
         overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
-        overlay.querySelector(".alive-btn").addEventListener("click", () => close("alive"));
+        const aliveBtn = overlay.querySelector(".alive-btn");
+        if (aliveBtn) aliveBtn.addEventListener("click", () => close("alive"));
         overlay.querySelector(".expired-btn").addEventListener("click", () => close("expired"));
       });
     }
@@ -896,7 +999,7 @@
       try {
         await api("POST", "/accounts/status", { ref: openid, status: next });
         toast(`「${name}」已标记为${statusText(next)}`, "success");
-        await loadAccounts();
+        await loadAccounts({ background: true });
       } catch (e) { toast(`状态修正失败: ${e.message}`, "error"); }
     }
 
@@ -911,7 +1014,7 @@
           "确认整理", "primary", async () => {
             const res = await api("POST", "/accounts/compact", { confirm: true });
             toast(`已整理 ${res.changed} 个账号 ID`, "success");
-            await loadAccounts();
+            await loadAccounts({ background: true });
           });
       } catch (e) { toast(`整理失败: ${e.message}`, "error"); }
     }
@@ -926,7 +1029,7 @@
           "确认清理", "danger", async () => {
             const res = await api("POST", "/accounts/repair", { confirm: true });
             toast(`已清理 ${res.deleted} 条记录`, "success");
-            await loadAccounts();
+            await loadAccounts({ background: true });
           });
       } catch (e) { toast(`清理失败: ${e.message}`, "error"); }
     }
@@ -938,19 +1041,13 @@
       setTimeout(() => { location.href = "/login"; }, 600);
     }
 
+    // 只负责「有没有登录」这一件事。版本号、用户名、退出登录统一由外壳顶栏渲染，
+    // 页面里不再各存一份，免得两处数据不一致。
     async function loadAuthStatus() {
       try {
         const s = await api("GET", "/api/auth/status");
-        // 版本号写入 title，hover 时能看到提交号与构建时间，避免顶栏被长文本挤爆
-        if (s && s.version) {
-          $("versionPill").textContent = `v${s.version}`;
-          const commit = s.commit && s.commit !== "unknown" ? s.commit : "无 VCS 信息";
-          const built = s.build_date && s.build_date !== "unknown" ? s.build_date : "未注入";
-          $("versionPill").title = `版本 v${s.version}\n提交 ${commit}\n构建 ${built}`;
-        }
-        if (s && s.username) $("userName").textContent = s.username;
-        if (!s || !s.authenticated) {
-          location.replace(s && !s.initialized ? "/setup" : "/login");
+        if (!s || s.authenticated !== true) {
+          location.replace(s && s.initialized === false ? "/setup" : "/login");
           return false;
         }
         return true;
@@ -1015,29 +1112,69 @@
 
       $("appidLabel").textContent = isOAuth ? "公众号 APPID" : "小程序 APPID";
       $("appidInput").placeholder = isOAuth ? "输入公众号 AppID（18 位，wx 开头）" : "输入目标小程序 AppID";
+      // 提示前面带上渠道与实际走的分支：同一个能力在两条渠道下走的不是同一段代码，
+      // 出问题时先要知道它到底走了哪一条，否则看到拒绝也无从判断是不是走错了路。
+      const channelNote = channelPathHint(cap);
       $("featureHint").innerHTML = cap
-        ? cap.hint
+        ? (channelNote ? `<b>${channelNote}</b><br>` : "") + cap.hint
         : "选择能力后，这里会显示它的用途与所需参数。";
+      // 能力切换会改变路由与必填入参，命令必须跟着重算。
+      updateTestCommand();
     }
 
-    /* ========== 主题切换 ========== */
-    (function initTheme() {
-      const saved = localStorage.getItem("yybwechat-theme");
-      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      if (saved === "dark" || (!saved && prefersDark)) {
-        document.documentElement.setAttribute("data-theme", "dark");
+    // channelPathHint 说明本次调用会落到哪条实现路径。
+    //
+    // 只做展示，不参与请求构造——真正的渠道路由由服务端按账号会话决定，
+    // 前端再传一遍渠道只会多出一个可以不一致的来源。
+    function channelPathHint(cap) {
+      if (!cap) return "";
+      const account = selectedAccount();
+      const product = account && account.scan_product === "pcmgr" ? "pcmgr" : "appstore";
+      const label = `${channelLabel(product)}`;
+      let path = "";
+      switch (cap.name) {
+        case "getPhoneNumber":
+          // 管家是原生 1141 + JSON 请求体；应用宝仍是字段 4/5/6/7 的 1020 兼容形态。
+          path = product === "pcmgr" ? "原生 1141 路径（待实测）" : "原有 1020 兼容路径";
+          break;
+        case "operateWxData":
+          path = product === "pcmgr" ? "versionType=1 原生路径" : "兼容路径";
+          break;
+        case "getCode":
+          path = "JSAPI 登录取码";
+          break;
       }
-      $("themeToggle").addEventListener("click", () => {
-        const isDark = document.documentElement.hasAttribute("data-theme");
-        if (isDark) {
-          document.documentElement.removeAttribute("data-theme");
-          localStorage.setItem("yybwechat-theme", "light");
-        } else {
-          document.documentElement.setAttribute("data-theme", "dark");
-          localStorage.setItem("yybwechat-theme", "dark");
+      return path ? `${label} · ${path}` : label;
+    }
+
+    // protocolResultFailure 判断「转发成功」之外，内层业务到底成没成。
+    //
+    // HTTP 200 只说明请求被转发出去了。小程序的真实结论在响应体的
+    // err_no / errcode / ret（或 base_resp.ret）里，而且常被包在
+    // 一层 JSON 字符串里，所以要逐层往下找几层。
+    // 不判断这个，界面上会把「上游拒绝」显示成「调用完成」，最难查的那种假成功。
+    function protocolResultFailure(result) {
+      let value = result && result.result !== undefined ? result.result : result;
+      for (let depth = 0; depth < 4 && value; depth++) {
+        if (typeof value === "string") {
+          try { value = JSON.parse(value); } catch { break; }
         }
-      });
-    })();
+        if (!value || typeof value !== "object") break;
+        for (const key of ["err_no", "errcode", "ret"]) {
+          if (typeof value[key] === "number" && value[key] !== 0) return `${key}=${value[key]}`;
+        }
+        if (value.base_resp && typeof value.base_resp.ret === "number" && value.base_resp.ret !== 0) {
+          return `ret=${value.base_resp.ret}`;
+        }
+        value = value.data;
+      }
+      return "";
+    }
+
+    /* ========== 主题切换 ==========
+       主题由外壳脚本 platform.js 统一在 <head> 之后立即决定（读 localStorage，
+       没有记录时跟随系统），顶栏上的开关也在外壳里。页面不再各写一份，
+       否则同一个浏览器在两页之间会读到不一致的状态。 */
 
     /* ========== 数据加载 ========== */
     async function loadHealth() {
@@ -1053,16 +1190,40 @@
       }
     }
 
-    async function loadAccounts() {
-      $("accountStrip").innerHTML = `
-        <div class="skeleton skeleton-card"></div>
-        <div class="skeleton skeleton-card"></div>`;
+    // background=true 时不清空列表：只在后台拉数据后原地重绘。
+    //
+    // 接口测试、刷新存活这类操作成功后都会重新拉账号，如果每次都先把列表换成
+    // 骨架屏，容器高度会瞬间塌缩，浏览器把滚动位置弹回顶部——用户正在看的账号
+    // 和结果区一起被顶走。后台模式保留现有列表，失败也不替换成错误页。
+    async function loadAccounts(options = {}) {
+      const background = options.background === true;
+      const empty = $("accountEmpty");
+      if (!background) {
+        // 占位只能写 #accountEmpty：旧版的卡片骨架屏（#accountStrip）已经随
+        // UI 改版删掉了，继续引用它会拿到 null，赋值 innerHTML 直接抛
+        // TypeError——而这段在 try 之前，异常不会被下面的 catch 接住，整个
+        // 函数就地中断，renderAccounts 永远不执行。表现就是首屏一直停在
+        // 「账号加载中…」像没有账号，偏偏「刷新存活」走 background 分支绕开
+        // 了这段反而能正常出列表。
+        $("accountRows").innerHTML = "";
+        empty.hidden = false;
+        empty.innerHTML = `<div class="empty-state-inner">账号加载中…</div>`;
+      }
       try {
-        state.accounts = await api("GET", "/accounts");
+        const accounts = await api("GET", "/accounts");
+        state.accounts = accounts;
         renderAccounts();
-        setActivity(`已加载 ${state.accounts.length} 个账号`);
+        setActivity(background ? `已更新 ${accounts.length} 个账号` : `已加载 ${accounts.length} 个账号`);
       } catch (e) {
-        $("accountStrip").innerHTML = `<div class="empty-state"><div class="empty-state-inner"><span class="empty-state-icon">⚠</span>加载失败：${escapeHTML(e.message)}</div></div>`;
+        if (background) {
+          // 刷新失败同样保留现有列表：换成错误页等于把用户正在看的账号清掉。
+          toast(`账号刷新失败: ${e.message}`, "error");
+          setActivity("账号列表刷新失败");
+          return;
+        }
+        $("accountRows").innerHTML = "";
+        empty.hidden = false;
+        empty.innerHTML = `<div class="empty-state-inner"><span class="empty-state-icon">⚠</span>加载失败：${escapeHTML(e.message)}</div>`;
         setActivity("账号加载失败");
       }
     }
@@ -1075,7 +1236,7 @@
       try {
         await api("POST", "/accounts/refresh");
         toast("存活刷新完成", "success");
-        await loadAccounts();
+        await loadAccounts({ background: true });
       } catch (e) {
         toast(e.message || "刷新失败", "error");
       } finally {
@@ -1089,12 +1250,75 @@
       try {
         await api("POST", "/accounts/resync");
         toast("资料同步完成", "success");
-        await loadAccounts();
+        await loadAccounts({ background: true });
       } catch (e) {
         toast(e.message || "同步失败", "error");
       } finally {
         btn.classList.remove("loading"); btn.disabled = false;
       }
+    }
+
+    // buildTestRequest 是「执行调用」与「测试命令」共用的唯一请求构造入口。
+    //
+    // 之所以要抽出来：文档里的示例命令最容易和真实请求漂移。共用同一个构造器之后，
+    // 页面上显示的命令就是等一下真正会发出去的那个请求，不会出现「照命令复制却调不通」。
+    // 参数不合法时抛异常，由调用方决定是弹 toast 还是把原因写进命令预览。
+    function buildTestRequest() {
+      const cap = currentCapability();
+      if (!cap) throw new Error("请选择调用能力");
+      const account = selectedAccount();
+      // oauth 的 ref 只是可选的存在性校验，其余能力必须绑定账号
+      if (!account && cap.kind !== "oauth") throw new Error("请先选择一个账号");
+      const appID = $("appidInput").value.trim();
+      const body = {};
+      if (account) body.ref = account.openid;
+      if (cap.kind === "miniprogram" || cap.kind === "oauth") {
+        if (!appID) throw new Error(cap.kind === "oauth" ? "请输入公众号 APPID" : "请输入小程序 APPID");
+        body.app_id = appID;
+      }
+      if (cap.kind === "oauth") {
+        const redirect = $("redirectInput").value.trim();
+        if (!redirect) throw new Error("请输入授权回调地址");
+        body.redirect_uri = redirect;
+        body.scope = $("scopeSel").value;
+      }
+      if (cap.needsPayload) {
+        const raw = $("payloadInput").value.trim();
+        if (!raw) throw new Error("operateWxData 需要填写请求 JSON");
+        try { body.payload = JSON.parse(raw); } catch { throw new Error("JSON 格式不正确"); }
+        // 数组或字面量都能被 JSON.parse 接受，但协议侧只认对象；
+        // 在这里挡住比让服务端回一个看不懂的反序列化错误更有用。
+        if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
+          throw new Error("请求 JSON 必须是对象");
+        }
+      }
+      return { cap, route: `/wxapp/${cap.name}`, body };
+    }
+
+    // updateTestCommand 把当前请求渲染成可复制的命令行。
+    // 引号策略：Bash 用 '\'' 转义单引号，PowerShell 用 '' 双写；
+    // 令牌一律引用环境变量，绝不把页面里填的令牌写进预览文本。
+    function updateTestCommand() {
+      const output = $("commandPreview"), button = $("copyCommandBtn");
+      if (!output || !button) return;
+      let built;
+      try {
+        built = buildTestRequest();
+      } catch (error) {
+        output.textContent = error.message;
+        button.disabled = true;
+        return;
+      }
+      const url = location.origin + built.route;
+      const payload = JSON.stringify(built.body);
+      if ($("commandShell").value === "pwsh") {
+        const quote = value => "'" + value.replaceAll("'", "''") + "'";
+        output.textContent = `Invoke-RestMethod -Method Post -Uri ${quote(url)} -ContentType 'application/json' -Headers @{ Authorization = "Bearer $env:YYB_PROTOCOL_TOKEN" } -Body ${quote(payload)}`;
+      } else {
+        const quote = value => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+        output.textContent = `curl --request POST ${quote(url)} \\\n  --header 'Content-Type: application/json' \\\n  --header "Authorization: Bearer \${YYB_PROTOCOL_TOKEN}" \\\n  --data-raw ${quote(payload)}`;
+      }
+      button.disabled = false;
     }
 
     async function callFeature() {
@@ -1105,30 +1329,14 @@
       // oauth 的 ref 只是可选的存在性校验，其余能力必须绑定账号
       if (!account && cap.kind !== "oauth") { toast("请先选择一个账号", "error"); return; }
 
-      const appID = $("appidInput").value.trim();
-      const body = {};
-      if (account) body.ref = account.openid;
-
-      if (cap.kind === "miniprogram" || cap.kind === "oauth") {
-        if (!appID) {
-          toast(cap.kind === "oauth" ? "请输入公众号 APPID" : "请输入小程序 APPID", "error");
-          return;
-        }
-        body.app_id = appID;
+      let built;
+      try {
+        built = buildTestRequest();
+      } catch (error) {
+        toast(error.message, "error");
+        return;
       }
-
-      if (cap.kind === "oauth") {
-        const redirect = $("redirectInput").value.trim();
-        if (!redirect) { toast("请输入授权回调地址", "error"); return; }
-        body.redirect_uri = redirect;
-        body.scope = $("scopeSel").value;
-      }
-
-      if (cap.needsPayload) {
-        const raw = $("payloadInput").value.trim();
-        if (!raw) { toast("operateWxData 需要填写请求 JSON", "error"); return; }
-        try { body.payload = JSON.parse(raw); } catch { toast("JSON 格式不正确", "error"); return; }
-      }
+      const body = built.body;
 
       const btn = $("callBtn");
       btn.classList.add("loading"); btn.disabled = true;
@@ -1139,7 +1347,18 @@
       try {
         const result = await api("POST", `/wxapp/${cap.name}`, body);
         const sec = ((performance.now() - t0) / 1000).toFixed(1);
-        setResult(result, `完成 · ${sec}s`, false);
+        // 「HTTP 200」不等于业务成功：先看内层业务码，别把上游拒绝显示成调用完成。
+        const failure = protocolResultFailure(result);
+        const outcome = failure
+          ? `上游拒绝：${failure}`
+          : cap.kind === "oauth"
+            ? "已生成链接，待微信授权"
+            : cap.name === "getUserInfo"
+              ? "已读取渠道资料"
+              : (cap.needsPayload || cap.name === "getPhoneNumber")
+                ? "转发完成，请检查内层业务结果"
+                : "调用完成";
+        setResult(result, `${outcome} · ${sec}s`, Boolean(failure));
         // oauth 只返回链接，直接把可点击的地址交给用户最有用
         if (cap.kind === "oauth" && result && result.full_url) {
           setActivity(`已生成授权链接（scope=${result.scope}）：${result.full_url}`);
@@ -1148,9 +1367,22 @@
             toast("授权链接已生成并复制到剪贴板", "success");
           } catch { toast("授权链接已生成，请从结果区复制", "success"); }
         }
-        await loadAccounts();
+        // 关键：调用成功后后台刷新，不重建列表骨架，避免结果区被顶出视口。
+        await loadAccounts({ background: true });
       } catch (e) {
-        setResult(e.data || e.message, `失败 ${e.status || ""}`.trim(), true);
+        if (e.status === 401) {
+          // 协议令牌没配或配错时，所有 /wxapp/* 都会被门禁挡回 401。
+          // 这跟「会话过期」不是一回事，不能把人踢回登录页。
+          setResult("协议令牌缺失或错误，请先在服务端配置 YYB_PROTOCOL_TOKEN 后重试。", "调用失败 401", true);
+        } else {
+          // 管家取票据被拒（20138/1）发生在具体 API 发出之前，单独说清楚，
+          // 否则会被误读成「接口本身不可用」或「账号要被封了」。
+          const ticketRefused = /PCMgr GetLoginBuffer rejected: code=1\b/.test(String(e.message || ""));
+          const detail = ticketRefused
+            ? `PCMgr 取票据失败（20138/1），本次接口未执行。请先核对该渠道的小程序授权。\n\n${e.data || e.message}`
+            : (e.data || e.message);
+          setResult(detail, ticketRefused ? "渠道取票据失败" : `失败 ${e.status || ""}`.trim(), true);
+        }
       } finally {
         btn.classList.remove("loading"); btn.disabled = false;
       }
@@ -1205,9 +1437,12 @@
     }
 
     /* ========== 事件绑定 ========== */
-    $("reloadAccountsBtn").addEventListener("click", loadAccounts);
+    // 手动「重新加载」是用户主动行为，走前台模式重建列表（骨架屏也是明确反馈）；
+    // 这里必须包一层：直接把函数当监听器会把 MouseEvent 传进 options。
+    $("reloadAccountsBtn").addEventListener("click", () => loadAccounts());
     $("refreshAllBtn").addEventListener("click", refreshAll);
     $("resyncAllBtn").addEventListener("click", resyncAll);
+    $("mergeBtn").addEventListener("click", openAccountMergeDialog);
     $("featureSel").addEventListener("change", syncFeatureForm);
     $("callBtn").addEventListener("click", callFeature);
     $("clearResultBtn").addEventListener("click", () => setResult("结果已清空。", "等待调用", false));
@@ -1218,9 +1453,25 @@
       } catch { toast("复制失败，请手动选择", "error"); }
     });
     $("searchInput").addEventListener("input", () => renderAccounts());
+    // 测试命令随格式、账号与参数实时更新：命令与真实请求共用同一个构造器，
+    // 所以这里只需要在会改变请求的输入项上挂一次刷新。
+    $("commandShell").addEventListener("change", updateTestCommand);
+    $("copyCommandBtn").addEventListener("click", async () => {
+      const text = $("commandPreview").textContent;
+      if (!text || $("copyCommandBtn").disabled) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("命令已复制到剪贴板", "success");
+      } catch { toast("复制失败，请手动选择命令文本", "error"); }
+    });
+    ["appidInput", "redirectInput", "scopeSel", "payloadInput"].forEach(id => {
+      const node = $(id);
+      if (node) node.addEventListener("input", updateTestCommand);
+      if (node) node.addEventListener("change", updateTestCommand);
+    });
     $("saveWebhookBtn").addEventListener("click", saveWebhook);
     $("testWebhookBtn").addEventListener("click", testWebhook);
-    $("logoutBtn").addEventListener("click", logout);
+    // 退出登录已收进左侧栏底部（外壳统一提供），本页不再重复放置按钮
     $("changePwdBtn").addEventListener("click", changePassword);
     $("compactBtn").addEventListener("click", compactAccounts);
     $("repairBtn").addEventListener("click", repairAccounts);
@@ -1229,12 +1480,16 @@
     // 先确认管理员会话有效，再加载账号等敏感数据
     (async () => {
       if (!(await loadAuthStatus())) return;
-      loadHealth();
-      loadFeatures();
-      loadAccounts();
-      loadWebhook();
+      // 每个取数步骤独立容错：任何一步抛异常都不该连坐掉后面的步骤，
+      // 否则界面会停在半成品状态，而且看不出到底是哪一步出的问题。
+      for (const step of [loadHealth, loadFeatures, loadAccounts, loadWebhook]) {
+        try { await step(); } catch (e) { console.warn("启动步骤失败", e); }
+      }
       setInterval(loadHealth, 15000);
     })();
   </script>
+  <!-- 外壳放在页面脚本之后：先把 #pageActions 里的按钮绑定好，再整体搬进顶栏，
+       这样页面逻辑完全不用关心自己最终显示在哪一层容器里。 -->
+  <script src="/static/js/platform.js?v=20261030-ui3"></script>
 </body>
 </html>

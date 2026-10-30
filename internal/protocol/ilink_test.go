@@ -76,7 +76,7 @@ func TestParseLoginBufferRejectsInvalid(t *testing.T) {
 // TestRandomSessDeviceFormat 校验设备 MAC 的两个关键位：
 // 最低位为 0 表示单播，次低位为 1 表示本地管理。
 //
-// 注意这里**不**断言首字节等于 02：generateDeviceMAC 用的是 (b|0x02)&0xfe，
+// 注意这里**不**断言首字节等于 02：randomSessDevice 用的是 (b|0x02)&0xfe，
 // 首字节是随机的偶数（如 4A、B2），只保证上述两个位，并非固定 02 开头。
 func TestRandomSessDeviceFormat(t *testing.T) {
 	seen := map[string]bool{}

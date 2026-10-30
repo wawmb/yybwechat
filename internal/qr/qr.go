@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"yybwechat/internal/pcmgr"
 	"yybwechat/internal/protocol"
 )
 
@@ -60,6 +61,9 @@ var (
 
 // Session 表示一个微信扫码登录会话，持有与微信服务器的 HTTP 连接和 Cookie。
 type Session struct {
+	// Product 是本次扫码使用的渠道：空/appstore = 应用宝，pcmgr = 腾讯电脑管家。
+	Product       string
+	ClientGUID    string
 	ID            string
 	WXUUID        string
 	QRCodeURL     string
@@ -126,7 +130,12 @@ func (c *Client) LoginBuffers() *protocol.LoginBufferClient { return c.loginBuff
 
 // GetQRCodeImage 创建扫码会话并获取二维码图片。
 func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
-	sess, err := c.CreateSession(ctx)
+	return c.GetQRCodeImageForProduct(ctx, "appstore")
+}
+
+// GetQRCodeImageForProduct 按渠道创建扫码会话。
+func (c *Client) GetQRCodeImageForProduct(ctx context.Context, product string) (ImageResult, error) {
+	sess, err := c.CreateSessionForProduct(ctx, product)
 	if err != nil {
 		return ImageResult{}, err
 	}
@@ -143,13 +152,41 @@ func (c *Client) GetQRCodeImage(ctx context.Context) (ImageResult, error) {
 }
 
 // CreateSession 向微信 OAuth 端点发起请求，解析并返回新的扫码会话。
+// OAuthURL 按渠道生成扫码授权地址。
+//
+// 两个渠道的 appid / redirect_uri / scope 完全不同，混用会拿到一张
+// 扫了也换不出凭据的二维码。
+func OAuthURL(product string) (string, error) {
+	switch product {
+	case "", "appstore":
+		return oauthURL, nil
+	case "pcmgr":
+		return "https://open.weixin.qq.com/connect/qrconnect?" + url.Values{
+			"appid": {pcmgr.HostAppID}, "redirect_uri": {"https://security.guanjia.qq.com/login"},
+			"response_type": {"code"}, "scope": {"snsapi_login,snsapi_runtime_pcsdk"},
+			"state": {"233"}, "self_redirect": {"true"},
+		}.Encode(), nil
+	default:
+		return "", fmt.Errorf("unsupported scan channel")
+	}
+}
+
 func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
+	return c.CreateSessionForProduct(ctx, "appstore")
+}
+
+// CreateSessionForProduct 按渠道创建扫码会话；GUID 是管家渠道的身份标识，后续换票要用。
+func (c *Client) CreateSessionForProduct(ctx context.Context, product string) (*Session, error) {
+	oauth, err := OAuthURL(product)
+	if err != nil {
+		return nil, err
+	}
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 	hc := &http.Client{Timeout: c.timeout, Jar: jar, Transport: c.transport}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oauthURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oauth, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +206,13 @@ func (c *Client) CreateSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 	wxuuid := m[1]
+	guid, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
 	return &Session{
+		Product:    product,
+		ClientGUID: guid,
 		ID:         id,
 		WXUUID:     wxuuid,
 		QRCodeURL:  qrBase + wxuuid,
@@ -285,6 +328,28 @@ func (c *Client) GetLoginBuffer(ctx context.Context, sess *Session) (protocol.Lo
 	}
 	if sess.AuthorizeCode == "" {
 		return protocol.LoginBufferResult{}, fmt.Errorf("QR session is not authorized yet")
+	}
+	// 管家渠道的换票与取票据是完全不同的一套接口：先用 3078 指令把授权 code
+	// 换成管家侧的登录密钥，再用它取小程序票据。走应用宝的回调会直接失败。
+	if sess.Product == "pcmgr" {
+		if sess.Credentials == nil {
+			pc, err := pcmgr.ExchangeCode(ctx, sess.HTTPClient, sess.AuthorizeCode, sess.ClientGUID)
+			if err != nil {
+				return protocol.LoginBufferResult{}, err
+			}
+			sess.Credentials = &protocol.LoginBufferCredentials{
+				Provider: "pcmgr", PCMgr: pc, OpenID: pc.Identity(), Nickname: pc.Nickname,
+				ExpiresAt: pc.NextRenewAt(), ExpiresIn: pc.NextRenewAt() - pc.RenewedAt,
+				RefreshTokenObservedAt: time.Now().Unix(),
+			}
+		}
+		buffer, err := c.loginBuffers.FetchLoginBuffer(ctx, *sess.Credentials)
+		if err != nil {
+			return protocol.LoginBufferResult{}, err
+		}
+		sess.LoginBuffer = buffer
+		sess.Status = "confirmed"
+		return protocol.LoginBufferResult{LoginBuffer: buffer, Credentials: *sess.Credentials}, nil
 	}
 	cb := callbackURL + "?" + url.Values{
 		"login_type": {"WX"},
@@ -405,10 +470,14 @@ func credentialsFromJar(jar http.CookieJar, rawURL string) (protocol.LoginBuffer
 		OpenID:       openid,
 		AccessToken:  accessToken,
 		RefreshToken: values["refreshtoken"],
-		LoginType:    defaultString(values["logintype"], "WX"),
-		Nickname:     values["nickname"],
-		ExpiresAt:    time.Now().Unix() + expiresIn,
-		ExpiresIn:    expiresIn,
+		// 扫码走的是 /pc_yyb/pcyyb_oauth，凭据属于 pc_yyb 业务侧。
+		// 标下来源，续期才会走对端点——走 _auth 侧续期会被微信拒绝，
+		// 表现就是"扫码账户用一段时间后突然需要重扫"。
+		RefreshBusinessID: "pc_yyb",
+		LoginType:         defaultString(values["logintype"], "WX"),
+		Nickname:          values["nickname"],
+		ExpiresAt:         time.Now().Unix() + expiresIn,
+		ExpiresIn:         expiresIn,
 	}, nil
 }
 

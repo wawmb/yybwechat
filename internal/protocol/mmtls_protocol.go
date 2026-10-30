@@ -307,7 +307,10 @@ func parseShortlink(pkt []byte) (shortlinkPacket, error) {
 		return shortlinkPacket{}, fmt.Errorf("shortlink packet too short")
 	}
 	total := int(binary.BigEndian.Uint32(pkt[:4]))
-	if total > len(pkt) {
+	// total < 16 时必须先挡住：包头本身占 16 字节，若声明长度比包头还小，
+	// pkt[16:total] 会直接切片越界 panic。这段输入来自网络（或中间代理），
+	// 一个畸形响应就足以让整个进程崩掉，不能只判「大于缓冲」。
+	if total < 16 || total > len(pkt) {
 		return shortlinkPacket{}, fmt.Errorf("shortlink packet truncated")
 	}
 	return shortlinkPacket{

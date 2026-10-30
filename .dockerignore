@@ -17,6 +17,10 @@ resource/qr/*
 Dockerfile
 .dockerignore
 
+# 上游参考快照与本地笔记（只用于比对，不参与编译）
+YYB-Go-Enhanced-main/
+.workbuddy/
+
 # 构建产物
 yybwechat
 *.exe

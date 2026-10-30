@@ -4,6 +4,9 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"yybwechat/internal/store"
 )
 
 // 本文件实现账号维护类接口：备注修改、残缺账号清理、ID 紧凑化与手动状态调整。
@@ -99,8 +102,48 @@ func (a *App) handleAccountRepair(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 删除后必须回收这些 ID 上的运行时状态：代理租约、失败退避与「连续拒绝」
+	// 计数都是以账号 ID 为键的。账号删掉后 ID 会被后续写入或 /accounts/compact
+	// 重新分配，残留状态就会套到一个完全无关的新账号上——它可能因此用着别人的
+	// 代理出口，或者莫名被跳过刷新。
+	for _, id := range ids {
+		a.invalidateProxyLease(id)
+		a.clearKeepAliveRetry(id)
+		a.clearCredentialRejections(id)
+	}
 	log.Printf("[maintenance] 已清理 %d 条残缺账号记录", deleted)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted, "requested": len(ids)})
+}
+
+// accountCompactItem 是紧凑化预览里的一条 ID 变更对照。
+type accountCompactItem struct {
+	OldID  int64  `json:"old_id"`
+	NewID  int64  `json:"new_id"`
+	Label  string `json:"label"`
+	OpenID string `json:"openid"`
+}
+
+// accountCompactPlan 按「列表顺序即新 ID」算出每个账号的迁移结果。
+// 只列出真正会变的：ID 已经连续的账号不进清单，否则预览里全是噪音。
+func accountCompactPlan(accounts []*store.WechatAccount) ([]accountCompactItem, map[int64]int64) {
+	items := make([]accountCompactItem, 0, len(accounts))
+	mapping := make(map[int64]int64)
+	for index, account := range accounts {
+		if account == nil {
+			continue
+		}
+		newID := int64(index + 1)
+		if account.ID == newID {
+			continue
+		}
+		mapping[account.ID] = newID
+		label := firstAccountLabel(account.Remark, account.Nickname, account.Alias)
+		if label == "" {
+			label = "未命名账号"
+		}
+		items = append(items, accountCompactItem{OldID: account.ID, NewID: newID, Label: label, OpenID: account.OpenID})
+	}
+	return items, mapping
 }
 
 // handleAccountCompact 将账号 ID 重排为连续的 1..N。
@@ -136,11 +179,16 @@ func (a *App) handleAccountCompact(w http.ResponseWriter, r *http.Request) {
 				gaps++
 			}
 		}
+		items, mapping := accountCompactPlan(accounts)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"current_ids": ids,
 			"gaps":        gaps,
 			"will_change": gaps > 0,
-			"hint":        "确认整理请再次提交 {\"confirm\": true}，执行后需同步调整脚本中的账号 ID",
+			// changes 是「哪个号会被改成几」的逐条对照。
+			// 只有空洞数量时看不出自己的脚本要改哪些引用，这份清单才是真正有用的部分。
+			"changes":          items,
+			"confirm_required": len(mapping) > 0,
+			"hint":             "确认整理请再次提交 {\"confirm\": true}，执行后需同步调整脚本中的账号 ID",
 		})
 		return
 	}
@@ -153,6 +201,9 @@ func (a *App) handleAccountCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"changed": 0, "mapping": map[string]int64{}})
 		return
 	}
+	// ID 已经重排，内存里所有以旧 ID 为键的状态（代理租约、失败退避、
+	// 连续拒绝计数）都不能留：它们会套到拿到同一个新 ID 的另一个账号身上。
+	a.resetAccountRuntimeState()
 	// 返回 old -> new 映射，便于调用方核对脚本中的账号引用
 	out := make(map[string]int64, len(mapping))
 	for oldID, newID := range mapping {
@@ -187,6 +238,13 @@ func (a *App) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// 「仅原会话可用」是上游明确拒绝过授权的结论，不能靠点一下按钮变成「仍有效」。
+	// 这样做只会让倒计时和卡片状态看起来正常，下一次调用立刻又被拒。
+	// 要恢复只能重新扫码——那会替换整份授权，属于另一条路径。
+	if acc.SessionOnly() && body.Status == "alive" {
+		writeError(w, http.StatusConflict, "授权已被拒绝，请重新扫码；不能手动改为仍有效")
+		return
+	}
 	oldStatus := accountStatus(acc)
 	if err := a.db.SetAccountStatus(r.Context(), acc.ID, body.Status); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -195,9 +253,12 @@ func (a *App) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	// 标记为失效时清理会话，避免继续复用已不可用的登录态
 	if body.Status == "expired" {
 		a.invalidateAccountSessions(r.Context(), acc.ID)
-		a.markKeepAliveRetry(acc.ID)
+		a.markKeepAliveRetry(acc.ID, credentialsNearExpiry(acc, time.Now()))
 	} else {
 		a.clearKeepAliveRetry(acc.ID)
+		// 手动置回可用：视为人工确认过凭据没问题，「连续拒绝」的账清零，
+		// 否则残留计数会让下一次单次 -109 就直接判死。
+		a.clearCredentialRejections(acc.ID)
 	}
 	if shouldNotifyStatusChange(oldStatus, body.Status) {
 		log.Printf("[maintenance] 账号 %s (%s) 状态被手动调整: %s → %s",
@@ -208,10 +269,25 @@ func (a *App) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 			if err := a.db.MarkStatusNotified(r.Context(), acc.ID, body.Status); err != nil {
 				log.Printf("[maintenance] 记录推送状态失败 (账号 %d): %v", acc.ID, err)
 			}
+			// 失效告警的记账列必须同步写上：否则下一轮扫描看到
+			// expiry_alerted_at 为空，会立刻再推一条内容重复的「账号已失效」，
+			// 运营者刚收到状态变更通知就又被同一件事打扰一次。
+			if body.Status == "expired" {
+				if err := a.db.MarkExpiryAlerted(r.Context(), acc.ID, time.Now().Unix()); err != nil {
+					log.Printf("[maintenance] 记录失效告警时间失败 (账号 %d): %v", acc.ID, err)
+				}
+			}
 		}
 	} else if err := a.db.MarkStatusNotified(r.Context(), acc.ID, body.Status); err != nil {
 		// 无需通知的调整（如状态未变化）直接对齐标记，避免被后台误判成待补推
 		log.Printf("[maintenance] 记录状态失败 (账号 %d): %v", acc.ID, err)
+	}
+	if body.Status == "alive" {
+		// 恢复到可用即代表本轮故障周期结束：清掉告警窗口，
+		// 这样它再次失效时会立刻告警，而不是被上一轮的 2 小时窗口吃掉。
+		if err := a.db.ClearExpiryAlerted(r.Context(), acc.ID); err != nil {
+			log.Printf("[maintenance] 清除续期告警标记失败 (账号 %d): %v", acc.ID, err)
+		}
 	}
 	updated, err := a.db.GetAccount(r.Context(), acc.ID)
 	if err != nil {

@@ -19,7 +19,7 @@
 # === 更新 ===
 #   docker rm -f yybwechat
 #   docker buildx build --platform linux/amd64 -t wawmb/yybwechat:latest --no-cache --progress=plain .
-#   docker run -d --name yybwechat -p 60006:8000 [-v ...] wawmb/yybwechat:latest
+#   docker run -d --name yybwechat --restart=always -p 60006:8000 -v yybwechat-data:/app/data wawmb/yybwechat:latest
 # =============================================================================
 
 # ---------- 第一阶段: 编译 ----------

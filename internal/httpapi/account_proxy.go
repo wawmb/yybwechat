@@ -38,7 +38,11 @@ type accountProxyIn struct {
 	ProtocolProxyMode   *string `json:"protocol_proxy_mode"`
 }
 
-const loginProductAppStore = "appstore"
+const (
+	loginProductAppStore = "appstore"
+	// loginProductPCMgr 是腾讯电脑管家渠道，凭据与续期完全独立于应用宝。
+	loginProductPCMgr = "pcmgr"
+)
 
 // normalizeLoginProduct 校验登录产品类型。目前只验证过应用宝凭据兑换链路。
 func normalizeLoginProduct(product string) (string, error) {
@@ -46,8 +50,8 @@ func normalizeLoginProduct(product string) (string, error) {
 	if product == "" {
 		return loginProductAppStore, nil
 	}
-	if product != loginProductAppStore {
-		return "", fmt.Errorf("登录产品 %q 尚未完成凭据兑换验证，目前仅支持 appstore", product)
+	if product != loginProductAppStore && product != loginProductPCMgr {
+		return "", fmt.Errorf("登录产品 %q 不受支持，目前仅支持 appstore 与 pcmgr", product)
 	}
 	return product, nil
 }
@@ -340,6 +344,42 @@ func (a *App) invalidateProxyLease(accountID int64) {
 	a.proxyMu.Lock()
 	delete(a.proxyLeases, accountID)
 	a.proxyMu.Unlock()
+}
+
+// qrProxyChoice 是「本次扫码选定的登录网络代理」。
+//
+// 扫码阶段就定下出口，是因为登录 IP 会被微信记住：扫完再改代理，
+// 后续保活换到另一个 IP，容易被判成异常登录。In 是原样表单，
+// 确认后按它写入账号设置；Spec 是解析后的策略，用于建客户端。
+type qrProxyChoice struct {
+	In   accountProxyIn
+	Spec proxysource.Spec
+}
+
+// qrProxyRequested 判断请求体是否真的要求指定代理。
+//
+// 只要显式给了 mode（哪怕是写错的 "socks5"），就交给归一化流程去报错——
+// 静默当成直连会让用户以为代理生效了，实际拿服务器 IP 登录了，事后很难发现。
+// 空 mode 且没有静态/API/供应商字段时才算「没指定」，继续走老路径
+// （直连，或沿用 ref 账号的代理），不会给新账号写多余的设置。
+func qrProxyRequested(body accountProxyIn) bool {
+	if strings.TrimSpace(body.Mode) != "" {
+		return true
+	}
+	return strings.TrimSpace(body.StaticProxy) != "" ||
+		strings.TrimSpace(body.APIURL) != "" ||
+		body.ProviderProfileID != nil
+}
+
+// takeQRProxyChoice 取出并清除某次扫码选定的代理（一次性消费）。
+func (a *App) takeQRProxyChoice(sessionID string) (qrProxyChoice, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	choice, ok := a.qrProxies[sessionID]
+	if ok {
+		delete(a.qrProxies, sessionID)
+	}
+	return choice, ok
 }
 
 // qrClientForSpec 为扫码流程创建绑定指定代理的客户端。

@@ -1,0 +1,99 @@
+/* =============================================================================
+   运行日志页
+   =============================================================================
+
+   只保留日志页专属的表格与筛选布局，颜色一律取自 console.css 的 token。
+   原先这里混用了 --platform-* 与一个从未定义的 --focus，
+   导致深色主题下徽标与焦点框都取不到值（焦点框直接失效）。
+   ============================================================================= */
+
+.logs-page { max-width: 1480px; }
+.logs-page .page-head { align-items: center; }
+
+/* 筛选区：桌面端一行铺开，窄屏折成两列 */
+.log-filters {
+  display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px;
+  padding: 16px 18px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+.log-filters label { display: grid; gap: 6px; color: var(--muted); font-size: 11.5px; flex: 1 1 124px; }
+.log-filters .input, .log-filters .select { min-width: 0; }
+.log-filters input::placeholder { color: var(--faint); opacity: 1; }
+
+.log-toolbar, .log-pagination {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 18px 0 12px; color: var(--muted); font-size: 12px;
+}
+.log-toolbar p { margin: 0; }
+.live-toggle { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.live-toggle input { accent-color: var(--accent); }
+
+.log-table-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-sm); }
+.log-table { min-width: 0; table-layout: fixed; }
+.log-table th { font-weight: 640; }
+.log-table th:nth-child(1) { width: 160px; }
+.log-table th:nth-child(2) { width: 76px; }
+.log-table th:nth-child(3) { width: 92px; }
+.log-table th:nth-child(4) { width: 110px; }
+.log-table td { vertical-align: top; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.log-table time { font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* 每级用「浅底 + 同色文字」，深浅两套主题都由 token 自动跟随 */
+.log-badge {
+  display: inline-flex; align-items: center; padding: 1px 7px; border-radius: var(--radius-sm);
+  font-size: 12px; background: var(--surface-strong); color: var(--muted);
+}
+.log-badge[data-level="error"] { background: var(--danger-soft); color: var(--danger); }
+.log-badge[data-level="warn"] { background: var(--warning-soft); color: var(--warning); }
+.log-badge[data-level="info"] { background: var(--accent-soft); color: var(--accent); }
+
+.log-account { display: block; font-weight: 600; }
+.log-channel { color: var(--muted); font-size: 11px; }
+.log-detail {
+  margin-top: 5px; color: var(--muted);
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.log-detail summary { cursor: pointer; width: fit-content; padding: 2px 0; font-family: inherit; }
+.log-detail dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 16px; margin: 8px 0 0; }
+.log-detail dt, .log-detail dd { margin: 0; }
+.log-rejections {
+  display: block; margin-top: 3px; color: var(--danger);
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.log-empty { padding: 48px 16px; text-align: center; color: var(--muted); }
+.log-pagination { margin-top: 14px; }
+.log-pagination > div { display: flex; gap: 8px; }
+.log-footnote { color: var(--faint); font-size: 12px; line-height: 1.6; }
+.log-error { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+
+.logs-page :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+@media (max-width: 1000px) {
+  .log-filters label { flex-basis: 28%; }
+}
+
+/* 手机端：表格改卡片流，一行一条记录 */
+@media (max-width: 700px) {
+  .logs-page .page-head { align-items: flex-start; }
+  .log-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 14px; gap: 12px; }
+  .log-filters label:nth-child(5) { grid-column: 1 / -1; }
+  .log-filters .btn { width: 100%; }
+  .log-table-wrap { overflow: visible; }
+  .log-table thead { display: none; }
+  .log-table, .log-table tbody { display: block; width: 100%; }
+  .log-row {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 7px 12px;
+    padding: 14px; border-bottom: 1px solid var(--line);
+  }
+  .log-row:last-child { border-bottom: 0; }
+  .log-row td { padding: 0; border: 0; }
+  .log-row td:nth-child(1) { grid-column: 1; }
+  .log-row td:nth-child(2) { grid-column: 2; }
+  .log-row td:nth-child(3) { grid-column: 3; font-size: 12px; color: var(--muted); }
+  .log-row td:nth-child(4) { grid-row: 2; grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; }
+  .log-row td:nth-child(5) { grid-column: 1 / -1; }
+  .log-empty { display: block; }
+}

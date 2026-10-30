@@ -6,40 +6,18 @@
   <meta name="description" content="yybwechat — 代理设置">
   <title>代理设置 · yybwechat</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/css/console.css">
+  <link rel="stylesheet" href="/static/css/console.css?v=20261030-ui3">
+  <link rel="stylesheet" href="/static/css/platform.css?v=20261030-ui3">
   <style>
-    .app { min-height: 100vh; display: flex; flex-direction: column; }
-
-    .topbar {
-      height: var(--topbar-h); display: flex; align-items: center; justify-content: space-between; gap: 18px;
-      padding: 0 28px; background: linear-gradient(180deg, var(--bg), var(--bg-soft));
-      border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10;
-      backdrop-filter: blur(10px); box-shadow: var(--shadow-sm);
-    }
-    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-
-    .shell { width: min(1440px, 100%); margin: 0 auto; padding: 22px 28px 40px; display: grid; gap: 18px; }
-
-    .page-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
-    .page-head h2 { margin: 0; font-size: 20px; font-weight: 760; letter-spacing: -0.01em; }
-    .page-head p { margin: 6px 0 0; color: var(--muted); max-width: 76ch; }
-
-    .card {
-      background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-lg);
-      box-shadow: var(--shadow-sm); overflow: hidden;
-    }
-    .card-head {
-      display: flex; align-items: center; justify-content: space-between; gap: 16px;
-      padding: 15px 18px; border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, var(--surface), var(--bg));
-    }
-    .card-head h3 { margin: 0; font-size: 15px; font-weight: 740; }
-    .card-head p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    /* 页面专属：配置库表单、左右双栏工作区、模式切换。
+       颜色 / 圆角 / 阴影一律走 console.css 的 token，这里不写死任何色值。 */
 
     /* 配置库表单：一行排布，窄屏自动折行 */
     .profile-form {
       display: grid; gap: 12px; align-items: end; padding: 16px 18px;
-      grid-template-columns: minmax(150px, 1fr) repeat(3, minmax(120px, 0.75fr)) minmax(200px, 1.5fr) auto;
+      /* 7 条轨道：名称 / 类型 / 协议 / 授权 / 链接(占 2) / 按钮。
+         原先只有 6 条，链接字段再 span 2 就会溢出到第二行。 */
+      grid-template-columns: minmax(140px, 1fr) repeat(3, minmax(108px, 0.66fr)) minmax(160px, 1.3fr) minmax(160px, 1.3fr) auto;
     }
     .profile-form .wide { grid-column: span 2; }
     .profile-actions { display: flex; gap: 8px; align-items: center; }
@@ -121,7 +99,6 @@
     .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
     .form-grid > * { min-width: 0; }
     .form-grid .wide { grid-column: 1 / -1; }
-    .field-note { display: block; margin-top: 6px; color: var(--faint); font-size: 11px; line-height: 1.5; }
 
     .refresh-line { display: flex; align-items: center; gap: 12px; }
     .refresh-line input[type="range"] { flex: 1; min-width: 100px; accent-color: var(--primary); }
@@ -154,11 +131,6 @@
       .editor { padding: 18px; }
     }
     @media (max-width: 760px) {
-      .topbar { height: auto; flex-direction: column; align-items: flex-start; padding: 14px 16px; }
-      .top-actions { width: 100%; }
-      .top-actions .btn { flex: 1; }
-      .shell { padding: 16px; }
-      .page-head { flex-direction: column; }
       .editor-head { flex-direction: column; }
       .editor-note { max-width: none; text-align: left; }
       .form-grid, .mode-switch, .profile-form { grid-template-columns: minmax(0, 1fr); }
@@ -169,40 +141,28 @@
   </style>
 </head>
 <body>
-  <div class="app">
-    <header class="topbar">
-      <div class="brand">
-        <div class="mark" aria-hidden="true">Y</div>
-        <div>
-          <h1 class="brand-title">代理设置</h1>
-          <div class="brand-subtitle">供应商配置库 · 账号级出口 · 地区选择</div>
-        </div>
-      </div>
-      <div class="top-actions">
-        <button class="btn ghost" id="themeToggle" title="切换主题" aria-label="切换深色/浅色模式">🌓</button>
-        <a class="btn secondary" id="backToAccount" href="/">← 返回账号工作台</a>
-        <button class="btn secondary" id="reloadBtn" type="button">重新加载</button>
-      </div>
-    </header>
+  <!-- 顶栏按钮：由 platform.js 整体搬进外壳顶栏，id 与事件绑定不变 -->
+  <div class="top-actions" id="pageActions">
+    <button class="btn" id="reloadBtn" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4.5h-4.5"/></svg>重新加载</button>
+  </div>
 
-    <main class="shell">
+  <main>
+    <div class="page">
+      <!-- 页面标题由外壳顶栏提供（整页唯一的 h1），这里只放一句话说明 -->
       <div class="page-head">
-        <div>
-          <h2>把提取链接存成配置，再给每个账号选出口</h2>
-          <p>静态代理可用于账号保活；动态提取（品赞 / 巨量）每次都会换出口，只能用于扫码和临时请求，系统不会用它做自动保活。</p>
-        </div>
+        <p>把提取链接存成配置，再给每个账号选出口。静态代理可用于账号保活；动态提取（品赞 / 巨量）每次提取都会换出口，但同样参与保活——系统只在凭据临近到期时才真正提取一次，单次刷新内的多次尝试共用同一出口。</p>
       </div>
 
       <!-- 供应商配置库 -->
       <section class="card" id="profileCard" aria-labelledby="profileTitle">
         <div class="card-head">
-          <div>
-            <h3 id="profileTitle">代理配置库</h3>
-            <p>集中保存品赞、巨量或静态代理预设，账号只需引用配置并单独选择省市。</p>
+          <h2 id="profileTitle">代理配置库</h2>
+          <span class="hint">集中保存品赞、巨量或静态代理预设，账号只需引用配置并单独选择省市。</span>
+          <div class="right">
+            <select class="select" id="profilePicker" aria-label="选择代理配置" style="width:auto;min-width:180px">
+              <option value="new">＋ 新增配置</option>
+            </select>
           </div>
-          <select class="input" id="profilePicker" aria-label="选择代理配置" style="min-width:180px">
-            <option value="new">＋ 新增配置</option>
-          </select>
         </div>
         <form class="profile-form" id="profileForm">
           <div class="field">
@@ -256,11 +216,18 @@
 
       <!-- 账号代理 -->
       <section class="card" aria-label="账号代理管理">
+        <div class="card-head">
+          <h2>账号出口</h2>
+          <span class="hint">左边选账号，右边配出口；扫码与保活使用账号连接模式。</span>
+        </div>
         <div class="workspace">
           <aside class="accounts-pane">
             <div class="accounts-head">
               <div class="accounts-title"><strong>微信账号</strong><span id="accountCount">加载中…</span></div>
-              <input class="input" id="accountSearch" type="search" placeholder="搜索昵称、备注或 ID" aria-label="搜索微信账号">
+              <label class="search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+                <input id="accountSearch" type="search" placeholder="搜索昵称、备注或 ID" aria-label="搜索微信账号">
+              </label>
             </div>
             <div class="accounts-list" id="accountList">
               <div class="skeleton" style="height:60px"></div>
@@ -361,19 +328,13 @@
           </div>
         </div>
       </section>
-    </main>
-  </div>
+    </div>
+  </main>
 
   <script>
     const $ = id => document.getElementById(id);
-    // 与账号工作台共用同一个主题键，两个页面切换保持一致
-    (function initTheme() {
-      const saved = localStorage.getItem("yybwechat-theme");
-      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-      if (saved === "dark" || (!saved && prefersDark)) {
-        document.documentElement.setAttribute("data-theme", "dark");
-      }
-    })();
+    // 主题由外壳脚本 platform.js 统一初始化（与其它页面共用同一个 localStorage 键），
+    // 这里不再重复一份，避免两处判断顺序不同导致跨页面闪色。
 
     const state = {
       accounts: [],
@@ -593,7 +554,7 @@
       const cycle = Math.max(1, ttl - ahead);
       $("refreshValue").textContent = `提前 ${ahead} 分钟`;
       $("refreshEstimate").textContent = `预计约 ${cycle} 分钟刷新一次`;
-      $("refreshBasis").textContent = `按该账号凭据 ${ttl} 分钟有效期计算。提前量越小，刷新周期越长，提取代理的次数越少。动态代理只用于临时请求，系统不会用它做自动保活。`;
+      $("refreshBasis").textContent = `按该账号凭据 ${ttl} 分钟有效期计算。提前量越小，刷新周期越长，提取代理的次数越少。动态代理同样参与保活，凭据刷新沿用账号自己的出口（不切直连），单次刷新内的多次尝试共用同一出口。`;
     }
 
     async function fillEditor(account, config) {
@@ -650,8 +611,12 @@
     }
 
     function setReturnLink(id) {
+      // 「返回账号工作台」入口已由左侧栏取代，但 ?return= 旧链接仍可能带着参数进来；
+      // 锚点不存在时直接跳过，避免这里抛空指针中断整个初始化。
+      const back = $("backToAccount");
+      if (!back) return;
       const requested = new URLSearchParams(location.search).get("return");
-      $("backToAccount").href = requested && requested.startsWith("/") && !requested.startsWith("//")
+      back.href = requested && requested.startsWith("/") && !requested.startsWith("//")
         ? requested
         : `/?ref=${encodeURIComponent(id || "")}`;
     }
@@ -729,17 +694,6 @@
     }
 
     // ---- 事件绑定 ----
-
-    $("themeToggle").addEventListener("click", () => {
-      const isDark = document.documentElement.hasAttribute("data-theme");
-      if (isDark) {
-        document.documentElement.removeAttribute("data-theme");
-        localStorage.setItem("yybwechat-theme", "light");
-      } else {
-        document.documentElement.setAttribute("data-theme", "dark");
-        localStorage.setItem("yybwechat-theme", "dark");
-      }
-    });
 
     $("profilePicker").addEventListener("change", event => editProfile(event.target.value));
     $("profileProvider").addEventListener("change", toggleProfileFields);
@@ -919,5 +873,6 @@
       $("accountList").innerHTML = `<div class="list-empty">${escapeHTML(error.message)}</div>`;
     });
   </script>
+  <script src="/static/js/platform.js?v=20261030-ui3"></script>
 </body>
 </html>

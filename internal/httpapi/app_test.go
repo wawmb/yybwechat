@@ -3,11 +3,15 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"yybwechat/internal/qr"
 )
 
 // newAuthenticatedApp 创建一个已完成管理员初始化的 App，并返回可用的会话 Cookie。
@@ -100,7 +104,8 @@ func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
 	if !ok {
 		t.Fatalf("OpenAPI paths missing or invalid")
 	}
-	for _, path := range []string{"/wxapp/getCode", "/wxapp/getPhoneNumber", "/wxapp/operateWxData", "/accounts/avatar"} {
+	for _, path := range []string{"/wxapp/getCode", "/wxapp/getPhoneNumber", "/wxapp/operateWxData", "/accounts/avatar",
+		"/wx/code", "/wx/encryptkey", "/wx/getlatestuserkey", "/wx/getuserinfo", "/wx/getphonenumber"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("OpenAPI path %s missing", path)
 		}
@@ -167,6 +172,182 @@ func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
 	handler.ServeHTTP(oldPath, httptest.NewRequest(http.MethodPost, "/accounts/getCode", nil))
 	if oldPath.Code != http.StatusNotFound {
 		t.Fatalf("POST old account feature route status = %d", oldPath.Code)
+	}
+}
+
+// TestWXAliasRoutes 验证 /wx/* 兼容入口确实注册且受同一套校验约束。
+//
+// 这些路径等价于 /wxapp/*，但用的是客户端侧的命名习惯。
+// 三个关键约束：
+//   - 路由已注册（不是 404）；
+//   - 缺 payload 时明确指出缺什么，而不是把空 payload 发给微信侧；
+//   - 配置了协议令牌后必须被拦下（401），不能因为换了路径就绕过门禁。
+func TestWXAliasRoutes(t *testing.T) {
+	t.Setenv("GIN_MODE", "test")
+
+	newApp := func(token string) *App {
+		t.Helper()
+		app, err := NewApp(Config{
+			ResourceRoot:   t.TempDir(),
+			RequestTimeout: time.Second,
+			AvatarTimeout:  time.Second,
+			SessionTTL:     time.Minute,
+			QRSessionTTL:   time.Minute,
+			ProtocolToken:  token,
+		})
+		if err != nil {
+			t.Fatalf("NewApp() error = %v", err)
+		}
+		t.Cleanup(func() { _ = app.Close() })
+		return app
+	}
+
+	handler := newApp("").Handler()
+
+	// 只接受 POST 的别名：GET 应返回 405（说明路由存在且方法受限）
+	for _, path := range []string{
+		"/wx/code", "/wx/getphonenumber", "/wx/encryptkey", "/wx/getlatestuserkey",
+		"/wx/cloud", "/wx/mpgeta8key", "/wx/appmsgext", "/wx/appmsglike",
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET %s status = %d, want %d", path, rec.Code, http.StatusMethodNotAllowed)
+		}
+	}
+
+	// getUserInfo 别名允许 GET，但缺 ref 时应报参数错误而不是 404
+	userInfo := httptest.NewRecorder()
+	handler.ServeHTTP(userInfo, httptest.NewRequest(http.MethodGet, "/wx/getuserinfo", nil))
+	if userInfo.Code != http.StatusBadRequest {
+		t.Fatalf("GET /wx/getuserinfo without ref status = %d, want %d", userInfo.Code, http.StatusBadRequest)
+	}
+
+	// 缺 payload 必须报清楚，避免把空 payload 当成合法请求发出去
+	for _, path := range []string{"/wx/encryptkey", "/wx/getlatestuserkey", "/wx/cloud"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path,
+			strings.NewReader(`{"ref":"1","app_id":"wx0000000000000000"}`))
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "payload is required") {
+			t.Fatalf("POST %s without payload = %d %s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 配置令牌后，别名入口同样必须被门禁拦下
+	gated := newApp("secret-token").Handler()
+	for _, path := range []string{"/wx/encryptkey", "/wx/getlatestuserkey", "/wx/cloud", "/wx/code"} {
+		rec := httptest.NewRecorder()
+		gated.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("POST %s without token status = %d, want %d", path, rec.Code, http.StatusUnauthorized)
+		}
+	}
+}
+
+// TestNormalizeEncryptKeyPayload 验证客户端拼写会被改写成服务端操作名，
+// 且其余业务字段原样保留。
+func TestNormalizeEncryptKeyPayload(t *testing.T) {
+	tests := []struct {
+		name string
+		in   map[string]any
+		want string
+	}{
+		{name: "顶层客户端拼写", in: map[string]any{"api_name": "getLatestUserKey", "data": map[string]any{"appid": "wx-test"}}, want: encryptKeyOperation},
+		{name: "嵌套客户端拼写", in: map[string]any{"data": map[string]any{"api_name": "getLatestUserKey", "version": 2}}, want: encryptKeyOperation},
+		{name: "旧版服务端拼写", in: map[string]any{"api_name": "getUserEncryptKey"}, want: encryptKeyOperation},
+		{name: "服务端拼写保持不变", in: map[string]any{"api_name": encryptKeyOperation}, want: encryptKeyOperation},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeEncryptKeyPayload(tt.in)
+			if got["api_name"] == tt.want {
+				return
+			}
+			if nested, ok := got["data"].(map[string]any); ok && nested["api_name"] == tt.want {
+				return
+			}
+			t.Fatalf("normalized payload = %#v, want api_name %q", got, tt.want)
+		})
+	}
+
+	// 归一化不能把其他操作名改掉
+	other := normalizeEncryptKeyPayload(map[string]any{"api_name": "appmsgext"})
+	if other["api_name"] != "appmsgext" {
+		t.Fatalf("unrelated api_name changed to %v", other["api_name"])
+	}
+	// 不能修改调用方传入的 map（并发调用时可能被多处共享）
+	src := map[string]any{"api_name": "getLatestUserKey"}
+	_ = normalizeEncryptKeyPayload(src)
+	if src["api_name"] != "getLatestUserKey" {
+		t.Fatalf("normalizeEncryptKeyPayload mutated input: %#v", src)
+	}
+	if normalizeEncryptKeyPayload(nil) != nil {
+		t.Fatalf("nil payload should stay nil")
+	}
+}
+
+// TestOpenAPIScopesProtocolBearer 验证 Bearer 安全定义只作用于协议接口。
+//
+// 文档范围必须和路由门禁一致：如果管理接口也被标成「需要 Bearer」，
+// 使用者会以为令牌能替代网页登录；反过来协议接口漏标，
+// Swagger 里就不会带 Authorization 头，调一次 401 一次。
+func TestOpenAPIScopesProtocolBearer(t *testing.T) {
+	spec := newOpenAPISpec()
+
+	components, ok := spec["components"].(map[string]any)
+	if !ok {
+		t.Fatalf("spec.components missing")
+	}
+	schemes, ok := components["securitySchemes"].(map[string]any)
+	if !ok {
+		t.Fatalf("spec.components.securitySchemes missing")
+	}
+	bearer, ok := schemes["ProtocolBearer"].(map[string]any)
+	if !ok {
+		t.Fatalf("ProtocolBearer scheme missing")
+	}
+	if bearer["type"] != "http" || bearer["scheme"] != "bearer" {
+		t.Fatalf("ProtocolBearer = %#v, want http/bearer", bearer)
+	}
+
+	paths := spec["paths"].(map[string]any)
+	hasSecurity := func(path string) (bool, bool) {
+		item, ok := paths[path].(map[string]any)
+		if !ok {
+			t.Fatalf("path %s missing", path)
+		}
+		found401 := false
+		for _, value := range item {
+			operation := value.(map[string]any)
+			security, _ := operation["security"].([]map[string][]string)
+			for _, entry := range security {
+				if _, ok := entry["ProtocolBearer"]; ok {
+					if responses, ok := operation["responses"].(map[string]any); ok {
+						_, found401 = responses["401"]
+					}
+					return true, found401
+				}
+			}
+		}
+		return false, found401
+	}
+
+	for _, path := range []string{"/wxapp/getCode", "/wxapp/operateWxData", "/wx/encryptkey", "/wx/getlatestuserkey", "/wx/code"} {
+		secured, found401 := hasSecurity(path)
+		if !secured {
+			t.Fatalf("%s 未声明 ProtocolBearer 安全要求", path)
+		}
+		if !found401 {
+			t.Fatalf("%s 未声明 401 响应", path)
+		}
+	}
+
+	// 管理类与公开接口不能被标成需要协议令牌
+	for _, path := range []string{"/accounts/avatar", "/accounts/status", "/settings/webhook", "/health"} {
+		if secured, _ := hasSecurity(path); secured {
+			t.Fatalf("%s 不应要求协议令牌", path)
+		}
 	}
 }
 
@@ -365,5 +546,314 @@ func TestProtocolTokenGate(t *testing.T) {
 	handler.ServeHTTP(okRec, okReq)
 	if okRec.Code == http.StatusUnauthorized {
 		t.Fatalf("POST /wxapp/getCode (valid token) should pass the token gate")
+	}
+}
+
+// TestQRStatusTerminalDropsSession 验证二维码终态会立刻回收会话。
+//
+// 不回收的后果有两个：迟到的 confirm 会拿到一个看着还能用的会话白撞一次微信侧；
+// 内存与磁盘上的二维码图片要等到「下一次创建二维码」才可能被清掉。
+func TestQRStatusTerminalDropsSession(t *testing.T) {
+	t.Setenv("GIN_MODE", "test")
+	app, err := NewApp(Config{
+		ResourceRoot:   t.TempDir(),
+		RequestTimeout: time.Second,
+		AvatarTimeout:  time.Second,
+		SessionTTL:     time.Minute,
+		QRSessionTTL:   time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+
+	put := func(id string) {
+		app.mu.Lock()
+		app.qrSessions[id] = &qr.Session{ID: id}
+		app.mu.Unlock()
+	}
+
+	// 非终态：会话必须保留，轮询要继续
+	put("sess-pending")
+	app.finishQRPoll("sess-pending", "pending")
+	if app.getQRSession("sess-pending") == nil {
+		t.Fatalf("pending 会话被误删，轮询会断")
+	}
+	put("sess-scanned")
+	app.finishQRPoll("sess-scanned", "scanned")
+	if app.getQRSession("sess-scanned") == nil {
+		t.Fatalf("scanned 会话被误删，等待确认的流程会断")
+	}
+
+	// 终态：三种都要回收
+	for _, status := range []string{"expired", "cancelled", "unknown"} {
+		id := "sess-" + status
+		put(id)
+		app.finishQRPoll(id, status)
+		if app.getQRSession(id) != nil {
+			t.Fatalf("%s 终态会话未被回收", status)
+		}
+	}
+}
+
+// TestQRProxyRequested 判断请求体是否要求指定代理。
+//
+// 关键是「不能静默降级」：写了 mode 就必须走代理分支让后端校验，
+// 哪怕值写错也要报错，而不是悄悄用服务器 IP 去登录。
+func TestQRProxyRequested(t *testing.T) {
+	profileID := int64(7)
+	tests := []struct {
+		name string
+		body accountProxyIn
+		want bool
+	}{
+		{"空请求体沿用默认路径", accountProxyIn{}, false},
+		{"只带 product 不算指定代理", accountProxyIn{Product: "appstore"}, false},
+		{"直连", accountProxyIn{Mode: "direct"}, true},
+		{"静态代理", accountProxyIn{Mode: "static", StaticProxy: "1.2.3.4:8080"}, true},
+		{"动态 API", accountProxyIn{Mode: "api", APIURL: "https://api.example.com/get"}, true},
+		{"供应商配置", accountProxyIn{ProviderProfileID: &profileID}, true},
+		{"写错的 mode 也要走校验", accountProxyIn{Mode: "socks5"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := qrProxyRequested(tt.body); got != tt.want {
+				t.Fatalf("qrProxyRequested(%+v) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestQRRootRejectsBadProxyBeforeNetwork 验证代理参数有误时在建二维码之前就报错。
+//
+// 这些分支都在真正访问微信之前返回，所以测试不依赖外网：
+// 参数错了必须立刻告诉调用方，而不是先生成一张用错出口的二维码。
+func TestQRRootRejectsBadProxyBeforeNetwork(t *testing.T) {
+	t.Setenv("GIN_MODE", "test")
+	app, err := NewApp(Config{
+		ResourceRoot:   t.TempDir(),
+		RequestTimeout: time.Second,
+		AvatarTimeout:  time.Second,
+		SessionTTL:     time.Minute,
+		QRSessionTTL:   time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+
+	cases := []struct {
+		name string
+		body string
+		want int
+		part string
+	}{
+		{"产品不支持", `{"product":"wechat"}`, http.StatusUnprocessableEntity, "appstore"},
+		{"模式非法", `{"mode":"socks5"}`, http.StatusBadRequest, "代理模式"},
+		{"静态代理地址非法", `{"mode":"static","static_proxy":"not-a-proxy"}`, http.StatusBadRequest, "静态代理无效"},
+		{"动态 API 非法", `{"mode":"api","api_url":"ftp://x"}`, http.StatusBadRequest, "代理 API"},
+		{"供应商配置不存在", `{"mode":"api","provider_profile_id":999}`, http.StatusBadRequest, "代理配置不存在"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/qr", strings.NewReader(tc.body))
+			app.handleQRRoot(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.want, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.part) {
+				t.Fatalf("body = %s, want 含 %q", rec.Body.String(), tc.part)
+			}
+		})
+	}
+}
+
+// TestTakeQRProxyChoiceIsOneShot 验证代理选择只被消费一次。
+//
+// 复用同一个 session_id 再确认一次（浏览器重试）时不能把代理配置再写一遍，
+// 更不能把一个已经落库的账号重新当成新账号处理。
+func TestTakeQRProxyChoiceIsOneShot(t *testing.T) {
+	t.Setenv("GIN_MODE", "test")
+	app, err := NewApp(Config{
+		ResourceRoot:   t.TempDir(),
+		RequestTimeout: time.Second,
+		AvatarTimeout:  time.Second,
+		SessionTTL:     time.Minute,
+		QRSessionTTL:   time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+
+	choice := qrProxyChoice{In: accountProxyIn{Mode: "static", StaticProxy: "1.2.3.4:8080"}}
+	app.mu.Lock()
+	app.qrProxies["sess-1"] = choice
+	app.mu.Unlock()
+
+	got, ok := app.takeQRProxyChoice("sess-1")
+	if !ok || got.In.StaticProxy != "1.2.3.4:8080" {
+		t.Fatalf("第一次取值失败: ok=%v got=%+v", ok, got)
+	}
+	if _, ok := app.takeQRProxyChoice("sess-1"); ok {
+		t.Fatalf("代理选择应被消费掉，第二次仍取到值")
+	}
+
+	// 会话回收时也要连带清掉，避免内存里留下永远用不到的代理配置
+	app.mu.Lock()
+	app.qrProxies["sess-2"] = choice
+	app.mu.Unlock()
+	app.dropQRSession("sess-2")
+	if _, ok := app.takeQRProxyChoice("sess-2"); ok {
+		t.Fatalf("dropQRSession 未清理代理选择")
+	}
+}
+
+// seedRuntimeState 给某个账号 ID 埋上代理租约、失败退避与连续拒绝计数。
+func seedRuntimeState(app *App, id int64) {
+	app.proxyMu.Lock()
+	app.proxyLeases[id] = accountProxyLease{Value: "socks5://1.2.3.4:1080", ExpiresAt: time.Now().Add(time.Minute)}
+	app.proxyMu.Unlock()
+
+	app.keepAliveMu.Lock()
+	app.keepAliveNext[id] = time.Now().Add(time.Hour)
+	app.keepAliveFails[id] = 2
+	app.credentialRejects[id] = 2
+	app.keepAliveMu.Unlock()
+}
+
+// runtimeStateCount 统计该账号在内存里还剩几项状态。
+func runtimeStateCount(app *App, id int64) int {
+	n := 0
+	app.proxyMu.Lock()
+	if _, ok := app.proxyLeases[id]; ok {
+		n++
+	}
+	app.proxyMu.Unlock()
+	app.keepAliveMu.Lock()
+	if _, ok := app.keepAliveNext[id]; ok {
+		n++
+	}
+	if _, ok := app.keepAliveFails[id]; ok {
+		n++
+	}
+	if _, ok := app.credentialRejects[id]; ok {
+		n++
+	}
+	app.keepAliveMu.Unlock()
+	return n
+}
+
+// TestDeleteAccountClearsRuntimeState 验证删除账号会连带清理内存状态。
+//
+// 这些状态以账号 ID 为键，而 /accounts/compact 会重排并复用 ID：
+// 残留的代理租约会让新账号用上一个账号的出口，残留的退避会让它被跳过刷新，
+// 残留的拒绝计数会让它下一次 -109 就被判死。
+func TestDeleteAccountClearsRuntimeState(t *testing.T) {
+	app, cookie := newAuthenticatedApp(t)
+
+	nick := "待删账号"
+	acc, err := app.db.UpsertAccount(context.Background(), "o_del_1", "lb",
+		nil, &nick, nil, nil, map[string]any{"openid": "o_del_1"}, nil)
+	if err != nil {
+		t.Fatalf("UpsertAccount() error = %v", err)
+	}
+	seedRuntimeState(app, acc.ID)
+	if got := runtimeStateCount(app, acc.ID); got != 4 {
+		t.Fatalf("前置状态埋点不完整，实际 %d 项", got)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/accounts?ref="+strconv.FormatInt(acc.ID, 10), nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	app.handleAccountsRoot(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE /accounts = %d %s", rec.Code, rec.Body.String())
+	}
+	if got := runtimeStateCount(app, acc.ID); got != 0 {
+		t.Fatalf("删除账号后仍残留 %d 项内存状态", got)
+	}
+}
+
+// TestCompactClearsRuntimeState 验证 ID 重排后清空所有账号级缓存。
+func TestCompactClearsRuntimeState(t *testing.T) {
+	app, cookie := newAuthenticatedApp(t)
+
+	ctx := context.Background()
+	nickA, nickB := "账号A", "账号B"
+	first, err := app.db.UpsertAccount(ctx, "o_first", "lb", nil, &nickA, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("UpsertAccount(first) error = %v", err)
+	}
+	second, err := app.db.UpsertAccount(ctx, "o_second", "lb", nil, &nickB, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("UpsertAccount(second) error = %v", err)
+	}
+	// 制造 ID 空洞，让紧凑化真的发生重排
+	if err := app.db.DeleteAccount(ctx, first.ID); err != nil {
+		t.Fatalf("DeleteAccount() error = %v", err)
+	}
+	seedRuntimeState(app, second.ID)
+
+	req := httptest.NewRequest(http.MethodPost, "/accounts/compact", strings.NewReader(`{"confirm":true}`))
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	app.handleAccountCompact(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /accounts/compact = %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"changed":1`) {
+		t.Fatalf("紧凑化结果异常: %s", rec.Body.String())
+	}
+	if got := runtimeStateCount(app, second.ID); got != 0 {
+		t.Fatalf("紧凑化后仍残留 %d 项内存状态（会套到新 ID 的账号身上）", got)
+	}
+}
+
+// TestAccountsExposeLastRefreshError 验证 /accounts 会带上最近一次刷新失败原因。
+//
+// 用户看到「需重扫」却不知道是微信拒绝、代理故障还是超时，
+// 原因以前只在容器日志里，排查只能靠登服务器翻日志。
+func TestAccountsExposeLastRefreshError(t *testing.T) {
+	t.Setenv("GIN_MODE", "test")
+	app, err := NewApp(Config{
+		ResourceRoot:   t.TempDir(),
+		RequestTimeout: time.Second,
+		AvatarTimeout:  time.Second,
+		SessionTTL:     time.Minute,
+		QRSessionTTL:   time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+
+	nick := "诊断账号"
+	acc, err := app.db.UpsertAccount(context.Background(), "o_diag", "lb",
+		nil, &nick, nil, nil, map[string]any{"openid": "o_diag"}, nil)
+	if err != nil {
+		t.Fatalf("UpsertAccount() error = %v", err)
+	}
+
+	// 没有失败过：不该出现该字段
+	rec := httptest.NewRecorder()
+	app.handleAccountsRoot(rec, httptest.NewRequest(http.MethodGet, "/accounts", nil))
+	if strings.Contains(rec.Body.String(), "last_error") {
+		t.Fatalf("未失败过的账号不应带 last_error: %s", rec.Body.String())
+	}
+
+	// 记录一次失败原因
+	app.noteRefreshError(acc.ID, errors.New("refresh failed: code=42007 msg=refresh_token expired"))
+	rec = httptest.NewRecorder()
+	app.handleAccountsRoot(rec, httptest.NewRequest(http.MethodGet, "/accounts", nil))
+	if !strings.Contains(rec.Body.String(), "42007") {
+		t.Fatalf("应带出失败原因，实际: %s", rec.Body.String())
+	}
+
+	// 刷新成功后清除
+	app.noteRefreshError(acc.ID, nil)
+	if got := app.lastRefreshError(acc.ID); got != "" {
+		t.Fatalf("成功后就应清空，仍有 %q", got)
 	}
 }

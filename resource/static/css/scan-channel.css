@@ -1,0 +1,26 @@
+/* =============================================================================
+   扫码渠道切换确认弹窗
+   =============================================================================
+
+   控制台与公开授权页共用（scan-channel.js 动态建 dialog）。
+   颜色一律取 console.css 的 token——原先这里写死了一套青绿字面值，
+   深色主题下弹窗会是一块刺眼的白板。
+   ============================================================================= */
+
+.scan-switch-dialog {
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px); overflow: auto; margin: auto;
+  padding: 18px; text-align: left;
+  border: 1px solid var(--line); border-radius: var(--radius-lg);
+  background: var(--surface); color: var(--ink);
+  box-shadow: var(--shadow-lg);
+  font-size: 12.5px; line-height: 1.6;
+}
+.scan-switch-dialog::backdrop { background: oklch(0.19 0.02 265 / 0.45); }
+.scan-switch-dialog h2 { font-size: 14px; font-weight: 620; margin-bottom: 10px; }
+.scan-switch-dialog p { margin: 8px 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.scan-switch-dialog .scan-switch-warning {
+  padding: 10px 12px; border-radius: var(--radius-md);
+  background: var(--warning-soft); color: var(--warning);
+}
+.scan-switch-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-top: 16px; }

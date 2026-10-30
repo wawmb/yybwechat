@@ -103,12 +103,16 @@ func TestWXOAuthAliasMatchesWXAppOAuth(t *testing.T) {
 	}
 }
 
-// TestKeepAliveSkipsDynamicProxyAccounts 覆盖动态代理账号不参与自动保活。
+// TestKeepAliveCoversDynamicProxyAccounts 覆盖动态代理账号的保活行为。
 //
-// 动态代理每次提取都换出口，用它续期既维持不了会话，又会把供应商额度烧光，
-// 还会制造「凭据已过期且续不上」的假告警。参照实现在这里做了跳过，
-// 移植时必须保留。
-func TestKeepAliveSkipsDynamicProxyAccounts(t *testing.T) {
+// 动态代理账号曾经被整条排除在自动保活之外，理由是"每次提取都换出口，
+// 用它刷新维持不了会话、还白耗额度"。代价是这类账号永远得不到保活，
+// 撑到 expires_at 就死掉——等于放弃了一批账号。现在照常参与保活，
+// 额度问题由代理租约解决（租约有效期内复用同一出口）。
+//
+// 刷新通道本身仍沿用账号代理，不另开直连：刷新出口与扫码/协议出口
+// 必须一致，否则微信侧看到的来源身份就变了。
+func TestKeepAliveCoversDynamicProxyAccounts(t *testing.T) {
 	t.Setenv("GIN_MODE", "test")
 	app, err := NewApp(Config{
 		ResourceRoot:      t.TempDir(),
@@ -143,7 +147,7 @@ func TestKeepAliveSkipsDynamicProxyAccounts(t *testing.T) {
 		t.Fatalf("direct-proxy account with expired credentials should not be skipped")
 	}
 
-	// 切到动态代理后必须跳过
+	// 切到动态代理后仍然要参与自动保活：否则这类账号撑到 expires_at 就死
 	if _, err := app.db.UpsertAccountProxySetting(ctx, acc.ID, "api", "http", "",
 		"https://api.example.com/get?num=1", nil, "", "", "", 600, nil); err != nil {
 		t.Fatalf("UpsertAccountProxySetting() error = %v", err)
@@ -152,8 +156,8 @@ func TestKeepAliveSkipsDynamicProxyAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAccount() error = %v", err)
 	}
-	if !app.keepAliveShouldSkip(refreshed) {
-		t.Fatalf("dynamic-proxy account must be skipped by keepalive")
+	if app.keepAliveShouldSkip(refreshed) {
+		t.Fatalf("dynamic-proxy account should be kept alive, otherwise it dies at expires_at")
 	}
 }
 

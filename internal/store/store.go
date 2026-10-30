@@ -84,6 +84,33 @@ CREATE TABLE IF NOT EXISTS account_proxy_settings (
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL
 );
+
+-- account_links 保存一次性授权链接。
+--
+-- 链接里的 token 本身才是凭证，这张表只存它的 SHA256（token_hash），
+-- 另外用 AES-GCM 加密存一份明文副本，用于管理页「复制链接」——
+-- 明文副本只在这台机器上可解，泄露数据库不等于泄露可用链接。
+--
+-- expected_openid 是跨渠道替换的安全边界：更新类链接必须由原账号扫码，
+-- 换了微信号就不能改。target_product 记录这条链接打算用哪个渠道扫码，
+-- switch_confirmed 表示运营者已经明确同意「换渠道 = 换身份」。
+CREATE TABLE IF NOT EXISTS account_links (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash       TEXT    NOT NULL UNIQUE,
+    token_ciphertext TEXT    NOT NULL DEFAULT '',
+    kind             TEXT    NOT NULL,
+    account_id       INTEGER NOT NULL REFERENCES wechat_accounts(id) ON DELETE CASCADE,
+    owner_user_id    INTEGER,
+    expected_openid  TEXT    NOT NULL DEFAULT '',
+    expires_at       INTEGER NOT NULL,
+    used_at          INTEGER,
+    revoked_at       INTEGER,
+    created_at       INTEGER NOT NULL,
+    target_product   TEXT    NOT NULL DEFAULT '',
+    switch_confirmed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_account_links_account ON account_links(account_id);
+CREATE INDEX IF NOT EXISTS idx_account_links_expires ON account_links(expires_at);
 `
 
 // Open 打开或创建 SQLite 数据库，执行建表迁移并返回 DB 实例。
@@ -108,6 +135,32 @@ type WechatAccount struct {
 	LastCheckedAt *int64         `json:"last_checked_at,omitempty"`
 	CreatedAt     int64          `json:"created_at"`
 	UpdatedAt     int64          `json:"updated_at"`
+
+	// credentialJSON 保存从库里读出来的原始凭据 JSON 快照。它不导出、不进
+	// JSON，只在做条件更新（CAS）时用来确认「这条记录还是我读到的那个版本」。
+	//
+	// 用途是防覆盖：一次扫码/刷新从读到写之间可能隔了几秒，期间保活可能已经
+	// 轮换了凭据。如果此时拿旧快照直接 UPDATE，就会把刚拿到的新 token 盖回去，
+	// 下一次续期必然被拒。用快照比对可以把这种竞态变成一次明确的失败。
+	credentialJSON sql.NullString
+}
+
+// StatusSessionOnly 是「授权已被拒绝、但缓存会话可能仍可用」的中间状态。
+//
+// 上游早期把 OAuth 被拒和 ILink 会话失效当成一件事：只要 refresh 被拒就清账号。
+// 实测发现两者并不等价——refresh 被拒之后，同一份会话仍然能完成 MMTLS 认证并
+// 取到 32 字符 code。所以这里单独开一个状态：既不宣称账号健康，也不把它判死。
+//
+// 进入该状态后：
+//   - 不再发起新握手、不再取新票据、不再走自动恢复、不重放业务请求；
+//   - 缓存会话仍可继续使用，成功也不算「保活恢复」；
+//   - 缓存缺失或到期后返回需重扫；手动标失效仍完整清理；
+//   - 禁止手动改回 alive（见 httpapi/account_maintenance.go）。
+const StatusSessionOnly = "session_only"
+
+// SessionOnly 判断账号是否处于「仅原会话可用」状态。
+func (a *WechatAccount) SessionOnly() bool {
+	return a != nil && a.Status != nil && strings.ToLower(strings.TrimSpace(*a.Status)) == StatusSessionOnly
 }
 
 // AccountPublic 是 WechatAccount 的安全公开视图，隐藏了 login_buffer 和 credentials 等敏感字段。
@@ -130,8 +183,27 @@ type AccountPublic struct {
 	CredentialExpiresAt    *int64  `json:"credential_expires_at,omitempty"`
 	CredentialExpiresIn    int64   `json:"credential_expires_in,omitempty"`
 	RescanRecommended      bool    `json:"rescan_recommended"`
-	CreatedAt              int64   `json:"created_at"`
-	UpdatedAt              int64   `json:"updated_at"`
+	// ScanProduct 是账号当初的扫码渠道：appstore = 应用宝，pcmgr = 腾讯电脑管家。
+	// 前端据此显示渠道标识，脚本也靠它区分两套续期语义：
+	// 应用宝有「扫码 30 天」窗口，电脑管家只有「下次续期」计划，两者不能互相套用。
+	ScanProduct string `json:"scan_product"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
+}
+
+// accountScanProduct 判定账号的扫码渠道。
+//
+// 优先看 OpenID 前缀：电脑管家账号的 OpenID 由本地生成（pcmgr:<账号标识>），
+// 一定带前缀，这是最可靠的来源。历史凭据里没有 provider 字段时也能正确判定。
+// 其次看凭据里的 provider，最后回落到应用宝。
+func accountScanProduct(openID string, credentials map[string]any) string {
+	if strings.HasPrefix(openID, "pcmgr:") {
+		return "pcmgr"
+	}
+	if provider := credentialString(credentials, "provider"); provider == "pcmgr" {
+		return "pcmgr"
+	}
+	return "appstore"
 }
 
 // credentialExpiresAt 从凭据映射中读取到期时间戳，无法判断时返回 0。
@@ -202,6 +274,11 @@ type SessionRow struct {
 	ExpiresAt       int64
 	CreatedAt       int64
 	UpdatedAt       int64
+
+	// blobJSON 是 session_blob 列的原始字符串快照。与 credentialJSON 同理，
+	// 它只在条件更新里当 CAS 令牌用：原生会话替换必须证明「我改的还是我读到的
+	// 那一行」，否则并发的扫码、密钥轮换或手动失效会被旧请求悄悄盖掉。
+	blobJSON string
 }
 
 // Open 打开或创建 SQLite 数据库，执行建表迁移并返回 DB 实例。
@@ -242,6 +319,10 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err = migrateAccountProxySettings(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err = migrateSettingsTable(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -271,7 +352,83 @@ func (db *DB) Close() error {
 	if db == nil || db.sql == nil {
 		return nil
 	}
-	return db.sql.Close()
+	err := db.sql.Close()
+	if db.sql.Stats().OpenConnections == 0 {
+		return err
+	}
+	// sql.DB.Close 只是停止接受新查询，**不会等待**正在建立中的连接。
+	// SQLite 在连接收尾时还会创建/删除 WAL 文件，此时如果调用方紧接着删掉
+	// 数据目录（测试里的 TempDir、容器重建时的清理），就会拿到
+	// "directory not empty" 这类看似无关的错误。这里最多等 5 秒。
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for db.sql.Stats().OpenConnections != 0 {
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			return errors.Join(err, errors.New("database close: pending connections did not stop within 5s"))
+		}
+	}
+	return err
+}
+
+// migrateAccountProxySettings 为旧库补齐代理设置表的新列。
+//
+// 少了这一步，从早期版本升级上来的库会在第一条代理相关查询上直接报
+// "no such column: provider_profile_id"——整个代理功能不可用，
+// 而新装的库一切正常，问题只在升级路径上出现。
+func migrateAccountProxySettings(ctx context.Context, db *sql.DB) error {
+	exists, err := sqliteTableExists(ctx, db, "account_proxy_settings")
+	if err != nil || !exists {
+		return err
+	}
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{"provider_profile_id", "INTEGER"},
+		{"region_code", "TEXT NOT NULL DEFAULT ''"},
+		{"region_province", "TEXT NOT NULL DEFAULT ''"},
+		{"region_city", "TEXT NOT NULL DEFAULT ''"},
+		{"refresh_ahead_seconds", "INTEGER NOT NULL DEFAULT 300"},
+		{"protocol_proxy_mode", "TEXT NOT NULL DEFAULT 'account'"},
+	}
+	for _, column := range columns {
+		ok, err := sqliteColumnExists(ctx, db, "account_proxy_settings", column.name)
+		if err != nil {
+			return err
+		}
+		if ok {
+			continue
+		}
+		if _, err = db.ExecContext(ctx, "ALTER TABLE account_proxy_settings ADD COLUMN "+column.name+" "+column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sqliteColumnExists 判断某张表是否已有指定列。
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, wanted string) (bool, error) {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == wanted {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // migrateSessionsTable 将旧版 wmpf_sessions 表迁移到 sessions 表。
@@ -356,22 +513,90 @@ func (db *DB) UpsertAccount(ctx context.Context, openid, loginBuffer string, ali
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.sql.ExecContext(ctx,
-		`INSERT INTO wechat_accounts
-		(openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, status_notified, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(openid) DO UPDATE SET
-		login_buffer=excluded.login_buffer, alias=excluded.alias, nickname=excluded.nickname,
-		avatar=excluded.avatar, user_info=excluded.user_info, credentials=excluded.credentials,
-		status=excluded.status, status_notified=excluded.status_notified, updated_at=excluded.updated_at,
-		expiry_alerted_at=0`,
-		openid, loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
-		userJSON, credJSON, nullableString(status), nullableString(status), now, now,
-	)
+	openid = strings.TrimSpace(openid)
+	if openid == "" {
+		return nil, errors.New("openid is required")
+	}
+	// 「查已有账号 → 算最小空闲 ID → 写入」必须在一个事务里完成，
+	// 否则两次并发成功的扫码会算到同一个空位，第二个必然撞主键。
+	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = tx.Rollback() }()
+
+	// 已有账号：原位更新。这里刻意把 expiry_alerted_at 归零——
+	// 重新扫码意味着重新拿到了一份授权，上一轮的失效告警记账要跟着失效，
+	// 否则新授权过期时会被「已经推送过」挡住。
+	var existingID int64
+	err = tx.QueryRowContext(ctx, "SELECT id FROM wechat_accounts WHERE openid=?", openid).Scan(&existingID)
+	if err == nil {
+		if _, err = tx.ExecContext(ctx,
+			`UPDATE wechat_accounts SET login_buffer=?, alias=?, nickname=?, avatar=?, user_info=?,
+credentials=?, status=?, status_notified=?, expiry_alerted_at=0, updated_at=? WHERE id=?`,
+			loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
+			userJSON, credJSON, nullableString(status), nullableString(status), now, existingID,
+		); err != nil {
+			return nil, err
+		}
+	} else if errors.Is(err, sql.ErrNoRows) {
+		// 新账号：占用「最小的空闲 ID」而不是继续自增。
+		//
+		// 这样「删掉唯一账号再重新扫码」会回到 ID 1，脚本里写的 @1 不用改；
+		// 否则 ID 一路涨到 37、38，运营者只能靠「整理 ID」去收，而整理又会
+		// 重排其他账号、连带把别人的引用打乱。已有账号的 ID 不受影响。
+		nextID, allocErr := lowestFreeAccountID(ctx, tx)
+		if allocErr != nil {
+			return nil, allocErr
+		}
+		if _, err = tx.ExecContext(ctx,
+			`INSERT INTO wechat_accounts
+			(id, openid, login_buffer, alias, nickname, avatar, user_info, credentials, status, status_notified, created_at, updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			nextID, openid, loginBuffer, nullableString(alias), nullableString(nickname), nullableString(avatar),
+			userJSON, credJSON, nullableString(status), nullableString(status), now, now,
+		); err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return db.GetAccountByOpenID(ctx, openid)
+}
+
+// lowestFreeAccountID 返回从 1 开始的最小空闲账号 ID。
+//
+// 调用方必须已开启事务：这里只做读取，真正的写入仍由调用方在同一事务里完成，
+// 否则并发时两个事务会挑到同一个空位。
+func lowestFreeAccountID(ctx context.Context, tx *sql.Tx) (int64, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM wechat_accounts ORDER BY id")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	nextID := int64(1)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		if id < nextID {
+			continue
+		}
+		if id == nextID {
+			nextID++
+			continue
+		}
+		// id > nextID：这里就是第一个空洞
+		break
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return nextID, nil
 }
 
 func (db *DB) GetAccount(ctx context.Context, id int64) (*WechatAccount, error) {
@@ -482,6 +707,61 @@ func (db *DB) SetAccountCredential(ctx context.Context, id int64, loginBuffer st
 	return err
 }
 
+// ApplyCredentialRefresh 以「条件更新」写回续期结果（凭据 + 状态）。
+//
+// 与按 ID 直写的区别在于 WHERE 里那一串比对：账号身份、原凭据快照、原 login_buffer
+// 与状态都必须还是调用方读到的那一份。一次刷新可能持续数秒，期间账号可能被
+// 「更新链接 / 合并 / 跨渠道重扫」整体替换；此时旧结果写进去会把新身份覆盖掉，
+// 外部表现就是「刚换完身份，过一会儿又变回旧号」。
+//
+// 返回 false 表示库里已被别人改过，本次结果应当丢弃——这不是错误，也不该告警。
+// status 为 expired 时会顺带清空凭据并删除会话（终态不再倒计时）。
+func (db *DB) ApplyCredentialRefresh(ctx context.Context, expected *WechatAccount, loginBuffer string, credentials map[string]any, status string) (bool, error) {
+	if expected == nil {
+		return false, errors.New("apply credential refresh requires an expected account snapshot")
+	}
+	if status == "expired" {
+		loginBuffer, credentials = "", nil
+	}
+	if status == StatusSessionOnly {
+		// 被拒的 token 与登录票据都不能再留着：它们已被上游明确否认，
+		// 留在库里只会被下一次调用再拿去撞墙。扫码时间属于审计元数据，
+		// 与 token 无关，必须保留——否则「这串授权是哪天扫的」就断了。
+		credentials = nil
+		if observed := credentialInt64(expected.Credentials, "refresh_token_observed_at"); observed > 0 {
+			credentials = map[string]any{"refresh_token_observed_at": observed}
+		}
+		loginBuffer = ""
+	}
+	encoded, err := marshalNullable(credentials)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().Unix()
+	tx, err := db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx,
+		`UPDATE wechat_accounts SET login_buffer=?, credentials=?, status=?, last_checked_at=?, updated_at=?
+WHERE id=? AND openid=? AND credentials IS ? AND login_buffer=? AND status IS ?`,
+		loginBuffer, encoded, status, now, now, expected.ID, expected.OpenID, expected.credentialJSON, expected.LoginBuffer, nullableString(expected.Status))
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if count == 1 && status == "expired" {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=?", expected.ID); err != nil {
+			return false, err
+		}
+	}
+	return count == 1, tx.Commit()
+}
+
 // SetAccountCredentialStatus 在同一个事务里更新凭据与状态。
 // 保活刷新成功后调用，避免出现「凭据已换新但状态仍是 unknown」的中间态。
 func (db *DB) SetAccountCredentialStatus(ctx context.Context, id int64, loginBuffer string, credentials map[string]any, status string) error {
@@ -516,6 +796,19 @@ func (db *DB) GetSession(ctx context.Context, accountID int64, tcpProxy string) 
 	row := db.sql.QueryRowContext(ctx,
 		"SELECT id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at FROM sessions WHERE wechat_account_id=? AND tcp_proxy=? AND expires_at>?",
 		accountID, tcpProxy, time.Now().Unix(),
+	)
+	return scanSession(row)
+}
+
+// GetSessionForRecovery 读取会话记录，**不**按本地到期时间过滤。
+//
+// 存在的理由：早期版本把缓存的 30 分钟本地期限当成了服务端会话失效，
+// 于是正常可用的会话在本地被标成过期。这里把「读得到」和「能不能用」
+// 分开：读的时候不看本地期限，能不能用由协议层按服务端下发的 PSK 期限判断。
+func (db *DB) GetSessionForRecovery(ctx context.Context, accountID int64, tcpProxy string) (*SessionRow, error) {
+	row := db.sql.QueryRowContext(ctx,
+		"SELECT id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at FROM sessions WHERE wechat_account_id=? AND tcp_proxy=?",
+		accountID, tcpProxy,
 	)
 	return scanSession(row)
 }
@@ -568,18 +861,29 @@ func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 // 因此它真实反映「这串凭据是哪天扫码得来的」。历史记录若没有该字段则保持为空，
 // 界面显示「未记录」，不做猜测性回填。
 func (a *WechatAccount) Public() AccountPublic {
+	product := accountScanProduct(a.OpenID, a.Credentials)
+	status := ""
+	if a.Status != nil {
+		status = strings.ToLower(strings.TrimSpace(*a.Status))
+	}
 	var refreshTokenObservedAt *int64
-	rescanRecommended := false
+	// 「仅原会话」本身就意味着授权已被拒，直接建议重扫，
+	// 不等 25 天窗口也不看凭据是否到期。
+	rescanRecommended := a.SessionOnly()
 	var credentialExpiresAtPtr *int64
 
 	credentialExpiresIn := credentialInt64(a.Credentials, "expires_in")
 	if credentialExpiresIn <= 0 {
 		credentialExpiresIn = 7200
 	}
-	if credentialString(a.Credentials, "refreshtoken") != "" {
+	// 电脑管家没有「扫码 30 天」这回事：它的凭据靠本机原生续期计划滚动，
+	// 套用应用宝的 25 天倒计时只会产生「建议重新扫码」的假告警。
+	if product != "pcmgr" && (credentialString(a.Credentials, "refreshtoken") != "" || a.SessionOnly()) {
 		if observedAt := credentialInt64(a.Credentials, "refresh_token_observed_at"); observedAt > 0 {
 			refreshTokenObservedAt = &observedAt
-			rescanRecommended = time.Now().Unix()-observedAt >= rescanRecommendSeconds
+			// 用 || 而不是覆盖：session_only 的判断与 25 天窗口是两个独立条件，
+			// 覆盖会让「刚扫的号但授权已被拒」显示成不需要重扫。
+			rescanRecommended = rescanRecommended || time.Now().Unix()-observedAt >= rescanRecommendSeconds
 		}
 	}
 	expiresAtValue := credentialExpiresAt(a.Credentials)
@@ -593,13 +897,19 @@ func (a *WechatAccount) Public() AccountPublic {
 		credentialExpiresAtPtr = &expiresAt
 		// 保活只把「瞬时失败」记为 unknown 以便重试，但缓存凭据一旦越过到期时刻，
 		// 界面就应引导运营者重扫，而不是让账号看上去仍然健康。
-		status := ""
-		if a.Status != nil {
-			status = strings.ToLower(strings.TrimSpace(*a.Status))
-		}
-		if !rescanRecommended && (status == "" || status == "unknown") && expiresAt <= time.Now().Unix() {
+		// 电脑管家例外：它的凭据到期就是「该续期了」，续期由原生接口滚动完成，
+		// 提示重扫会把人引向完全错误的操作。
+		if product != "pcmgr" && !rescanRecommended && (status == "" || status == "unknown") && expiresAtValue <= time.Now().Unix() {
 			rescanRecommended = true
 		}
+	}
+	// 已判死的应用宝账号一律建议重扫。
+	//
+	// expired 是终态：自动重试不会让它复活，唯一出路是重新扫码。
+	// 这条兜底必须独立于「凭据里有没有到期时间」——凭据被清空的账号
+	// （credentials 为 nil）根本没有到期时间，靠上面两条分支永远推不出来。
+	if !rescanRecommended && product != "pcmgr" && status == "expired" {
+		rescanRecommended = true
 	}
 
 	return AccountPublic{
@@ -617,6 +927,7 @@ func (a *WechatAccount) Public() AccountPublic {
 		CredentialExpiresAt:    credentialExpiresAtPtr,
 		CredentialExpiresIn:    credentialExpiresIn,
 		RescanRecommended:      rescanRecommended,
+		ScanProduct:            product,
 		CreatedAt:              a.CreatedAt,
 		UpdatedAt:              a.UpdatedAt,
 	}
@@ -665,6 +976,8 @@ func scanAccountRows(row accountScanner) (*WechatAccount, error) {
 	if credJSON.Valid && credJSON.String != "" {
 		_ = json.Unmarshal([]byte(credJSON.String), &a.Credentials)
 	}
+	// 保留原始 JSON 快照，供条件更新比对
+	a.credentialJSON = credJSON
 	return &a, nil
 }
 
@@ -681,6 +994,7 @@ func scanSession(row accountScanner) (*SessionRow, error) {
 	if err := json.Unmarshal([]byte(blob), &s.SessionBlob); err != nil {
 		return nil, fmt.Errorf("decode session_blob: %w", err)
 	}
+	s.blobJSON = blob
 	return &s, nil
 }
 

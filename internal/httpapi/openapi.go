@@ -1,9 +1,11 @@
 package httpapi
 
+import "strings"
+
 // newOpenAPISpec 构建并返回完整的 OpenAPI 3.0.3 规范文档。
 // 该文档描述了所有 API 端点的请求/响应格式，供 Swagger UI 渲染和外部工具使用。
 func newOpenAPISpec() map[string]any {
-	return map[string]any{
+	spec := map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
 			"title":       "yybwechat 接口文档",
@@ -19,6 +21,7 @@ func newOpenAPISpec() map[string]any {
 			{"name": "accounts", "description": "已保存的微信账号"},
 			{"name": "proxy", "description": "账号代理与代理供应商配置"},
 			{"name": "wxapp", "description": "wxapp 业务接口调用"},
+			{"name": "wx-alias", "description": "/wx/* 兼容别名（与 /wxapp/* 等价）"},
 			{"name": "settings", "description": "系统设置"},
 			{"name": "auth", "description": "管理员认证与会话"},
 			{"name": "system", "description": "服务元信息"},
@@ -41,8 +44,9 @@ func newOpenAPISpec() map[string]any {
 					"创建扫码登录会话",
 					[]map[string]any{
 						boolQueryParam("as_base64", "是否同时返回二维码图片的 data URI。"),
+						queryStringParam("ref", "已有账号的 ID/UIN/openid：沿用该账号的代理出口重新扫码。请求体里给了代理参数时不生效。", false),
 					},
-					nil,
+					jsonOptionalRequestBody(refSchema("QRCreateRequest")),
 					defaulted(map[string]any{
 						"200": jsonResponse("二维码会话创建成功。", refSchema("QRCreateResponse")),
 					}),
@@ -168,6 +172,16 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			// ---- /wx/* 兼容别名：与上面 /wxapp/* 同名能力的另一套路径拼写 ----
+			"/wx/code":             wxAliasOperation("获取小程序code（/wxapp/getCode 的别名）"),
+			"/wx/getuserinfo":      wxAliasOperation("获取微信用户信息（/wxapp/getUserInfo 的别名，支持 GET ?ref=）"),
+			"/wx/getphonenumber":   wxAliasOperation("获取手机号（/wxapp/getPhoneNumber 的别名）"),
+			"/wx/encryptkey":       wxAliasOperation("获取用户加密密钥（operateWxData: webapi_getuserencryptkey）"),
+			"/wx/getlatestuserkey": wxAliasOperation("获取用户加密密钥（getLatestUserKey 拼写，同上）"),
+			"/wx/cloud":            wxAliasOperation("云开发调用（operateWxData: cloud.callFunction）"),
+			"/wx/mpgeta8key":       wxAliasOperation("公众号临时链接换取（operateWxData: mpGetA8Key）"),
+			"/wx/appmsgext":        wxAliasOperation("公众号文章扩展信息（operateWxData: appmsgext）"),
+			"/wx/appmsglike":       wxAliasOperation("公众号文章点赞数据（operateWxData: appmsglike）"),
 			"/settings/webhook": map[string]any{
 				"get": openAPIOperation(
 					[]string{"settings"},
@@ -459,6 +473,26 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			"/api/system-logs": map[string]any{
+				"get": openAPIOperation(
+					[]string{"system"},
+					"读取运行日志（需登录）",
+					[]map[string]any{
+						queryStringParam("category", "分类：system / api / protocol / keepalive / account / management / auth", false),
+						queryStringParam("level", "等级：debug / info / warn / error", false),
+						queryStringParam("channel", "渠道：yyb / pcmgr", false),
+						queryStringParam("account_id", "账号 ID", false),
+						queryStringParam("before", "游标：只返回 id 小于该值的记录", false),
+						queryStringParam("since", "起始时间（毫秒时间戳）", false),
+						queryStringParam("limit", "每页条数，1-100，默认 50", false),
+					},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("日志列表。entries 按 id 倒序；has_more 为真时用 next_before 继续翻页。", freeFormObjectSchema("entries / has_more / next_before / retention_days / max_entries")),
+						"400": jsonErrorResponse("筛选条件或参数不合法。"),
+					}),
+				),
+			},
 			"/api/version": map[string]any{
 				"get": openAPIOperation(
 					[]string{"system"},
@@ -472,6 +506,16 @@ func newOpenAPISpec() map[string]any {
 			},
 		},
 		"components": map[string]any{
+			// 协议令牌的 Bearer 定义：Swagger 的 Authorize 填一次，
+			// 之后只有 /wx/* 与 /wxapp/* 的请求会带 Authorization 头。
+			// 管理类接口仍然要求网页登录，令牌不能替代它。
+			"securitySchemes": map[string]any{
+				"ProtocolBearer": map[string]any{
+					"type":        "http",
+					"scheme":      "bearer",
+					"description": "填写 YYB_PROTOCOL_TOKEN 的值（不含 Bearer 前缀）。未配置令牌时留空。仅用于 /wx/* 与 /wxapp/*，不会代替网页登录。",
+				},
+			},
 			"schemas": map[string]any{
 				"APIResponse": objectSchema([]string{"code", "msg", "data"}, map[string]any{
 					"code": map[string]any{"type": "integer", "example": 0, "description": "业务状态码，0 表示成功，非 0 表示业务错误。"},
@@ -485,6 +529,34 @@ func newOpenAPISpec() map[string]any {
 				}),
 				"HealthResponse": objectSchema([]string{"ok"}, map[string]any{
 					"ok": map[string]any{"type": "boolean"},
+				}),
+				"QRCreateRequest": objectSchema(nil, map[string]any{
+					"product": map[string]any{
+						"type": "string", "enum": []string{"appstore"}, "example": "appstore",
+						"description": "登录产品，目前仅支持 appstore。留空按 appstore 处理。",
+					},
+					"ref": map[string]any{"type": "string", "description": "已有账号引用：沿用它的代理出口重新扫码。"},
+					"mode": map[string]any{
+						"type": "string", "enum": []string{"direct", "static", "api"}, "example": "static",
+						"description": "本次扫码的登录网络代理。省略则直连（或沿用 ref 账号的代理）。扫完再改代理来不及——微信会记住登录 IP。",
+					},
+					"proxy_type":      map[string]any{"type": "string", "enum": []string{"http", "socks5"}, "description": "静态代理协议，默认 http。"},
+					"static_proxy":    map[string]any{"type": "string", "description": "静态代理地址，如 host:port 或 socks5://user:pass@host:port。"},
+					"api_url":         map[string]any{"type": "string", "description": "动态代理提取 API（http/https）。"},
+					"region_code":     map[string]any{"type": "string", "description": "地区编码（品赞按区县编码定位）。"},
+					"region_province": map[string]any{"type": "string", "description": "省份名称（巨量按省市名定位）。"},
+					"region_city":     map[string]any{"type": "string", "description": "城市名称（巨量按省市名定位）。"},
+					"provider_profile_id": map[string]any{
+						"type": "integer", "description": "引用代理供应商配置（品赞 / 巨量）时填它的 ID；填了就不用再给 api_url。",
+					},
+					"refresh_ahead_minutes": map[string]any{
+						"type": "integer", "example": 45,
+						"description": "该账号的提前续期时间（5-90 分钟），留空用默认值。",
+					},
+					"protocol_proxy_mode": map[string]any{
+						"type": "string", "enum": []string{"account", "direct"},
+						"description": "小程序调用出口：account 跟随账号代理，direct 直连。",
+					},
 				}),
 				"QRCreateResponse": objectSchema([]string{"session_id", "status", "image_url"}, map[string]any{
 					"session_id":   map[string]any{"type": "string"},
@@ -506,7 +578,7 @@ func newOpenAPISpec() map[string]any {
 					"alias":           nullableStringSchema("账号别名。"),
 					"nickname":        nullableStringSchema("账号昵称。"),
 					"avatar":          nullableStringSchema("本地头像路径或远程头像 URL。"),
-					"status":          nullableStringSchema("账号状态。"),
+					"status":          nullableStringSchema("账号状态：alive / unknown / expired；session_only 表示授权已被拒绝、仅允许使用已有缓存会话，需重新扫码。"),
 					"device_id":       nullableStringSchema("稳定设备 MAC 标识，格式 02-XX-XX-XX-XX-XX。"),
 					"remark":          nullableStringSchema("账号备注，本地字段，不参与微信侧同步。"),
 					"last_checked_at": nullableInt64Schema(),
@@ -527,7 +599,12 @@ func newOpenAPISpec() map[string]any {
 					},
 					"rescan_recommended": map[string]any{
 						"type":        "boolean",
-						"description": "扫码窗口已进入最后 5 天时置为 true，提示重新扫码。",
+						"description": "扫码窗口已进入最后 5 天时置为 true，提示重新扫码。电脑管家账号恒为 false（它没有 30 天扫码窗口）。",
+					},
+					"scan_product": map[string]any{
+						"type":        "string",
+						"enum":        []string{"appstore", "pcmgr"},
+						"description": "账号当初的扫码渠道：appstore = 应用宝，pcmgr = 腾讯电脑管家。两个渠道的凭据与续期语义不同，不能混用。",
 					},
 					"created_at": int64Schema(),
 					"updated_at": int64Schema(),
@@ -643,6 +720,26 @@ func newOpenAPISpec() map[string]any {
 			},
 		},
 	}
+
+	// 把 Bearer 授权精确限定到与路由门禁一致的范围内：
+	// 只有 /wx/* 与 /wxapp/* 需要协议令牌，管理类与公开接口不声明，
+	// 免得 Swagger 让使用者以为管理接口也能用令牌调用。
+	for path, item := range spec["paths"].(map[string]any) {
+		if !strings.HasPrefix(path, "/wx/") && !strings.HasPrefix(path, "/wxapp/") {
+			continue
+		}
+		for _, value := range item.(map[string]any) {
+			operation, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			operation["security"] = []map[string][]string{{"ProtocolBearer": {}}}
+			if responses, ok := operation["responses"].(map[string]any); ok {
+				responses["401"] = jsonErrorResponse("协议令牌缺失或错误。")
+			}
+		}
+	}
+	return spec
 }
 
 // openAPIOperation 构建 OpenAPI Operation 的辅助函数。
@@ -664,6 +761,24 @@ func openAPIOperation(tags []string, summary string, parameters []map[string]any
 func defaulted(responses map[string]any) map[string]any {
 	responses["default"] = jsonErrorResponse("错误响应。")
 	return responses
+}
+
+// wxAliasOperation 生成 /wx/* 兼容入口的 operation 定义。
+//
+// 这些入口的请求体与响应结构与对应的 /wxapp/* 完全一致，
+// 因此复用同一个 WxappRequest / WxappResponse 结构，只改摘要说明。
+func wxAliasOperation(summary string) map[string]any {
+	return map[string]any{
+		"post": openAPIOperation(
+			[]string{"wx-alias"},
+			summary,
+			nil,
+			jsonRequestBody(refSchema("WxappRequest")),
+			defaulted(map[string]any{
+				"200": jsonResponse("与对应 /wxapp/* 接口相同的返回结构。", refSchema("WxappResponse")),
+			}),
+		),
+	}
 }
 
 func jsonResponse(description string, schema map[string]any) map[string]any {

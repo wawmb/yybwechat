@@ -12,11 +12,15 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+
+	"yybwechat/internal/pcmgr"
 )
 
 const (
 	clientVersion = 524545
-	appVersion    = 1901
+	// clientVersionDefault 供 HTTPDNS 查询使用，与 ilink 客户端保持一致。
+	clientVersionDefault = clientVersion
+	appVersion           = 1901
 
 	transferCmd  = 0x0b41
 	jsLoginCmdID = 1029
@@ -55,6 +59,22 @@ type manualAuthTemp struct {
 	Ephemeral *ecdh.PrivateKey
 	OKM       []byte
 	CompBody  []byte
+	// RequestCipher 是本次请求实际发出的密文。原生响应验签要用它做哈希输入，
+	// 所以必须在加密时就记下来，不能事后从别处拼。
+	RequestCipher []byte
+}
+
+// ManualAuthRejectedError 表示 LongLink 握手已经成功，但登录票据被服务端拒绝。
+//
+// 单独成型的原因是它决定了后续处置方式：票据被拒跟网络失败完全不同——
+// 换一个 IP 重投同一张票不会变好，必须去拿一张新票；而它也不等于账号凭据失效，
+// 因为换票本身往往还能成功（access token 仍然可用）。
+type ManualAuthRejectedError struct {
+	Code int64
+}
+
+func (e *ManualAuthRejectedError) Error() string {
+	return fmt.Sprintf("ManualAuth rejected: code=%d", e.Code)
 }
 
 type AppSession struct {
@@ -103,13 +123,17 @@ func buildManualAuthRequest(loginBufferB64 string, appDeviceID []byte) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	appBase := append(pbLen(1, appDeviceID), pbVar(2, appVersion)...)
+	// 字段层级与官方序列化器一致：版本号（1901）写在**外层**第 2 字段，
+	// 内层 AppBaseRequest 只放设备标识；该原生分支也没有空的第 6 字段。
+	// 之前把版本塞进内层、并补一个空字段 6，解码出来的字节与官方不一致——
+	// 这类差异不会在本地报错，只会在服务端按「非官方客户端」处理时体现出来。
+	appBase := pbLen(1, appDeviceID)
 	thirdApp := pbLen(1, meta.Ticket)
 	out := make([]byte, 0, len(appBase)+len(thirdApp)+32)
 	out = append(out, pbLen(1, appBase)...)
+	out = append(out, pbVar(2, appVersion)...)
 	out = append(out, pbLen(3, thirdApp)...)
 	out = append(out, pbVar(4, 4)...)
-	out = append(out, pbLen(6, nil)...)
 	out = append(out, pbVar(7, 0)...)
 	out = append(out, pbVar(8, 6)...)
 	return out, nil
@@ -166,6 +190,18 @@ func buildLoginBody(loginBufferB64 string, deviceID, appDeviceID []byte, temp *m
 }
 
 func hybridECDHEncrypt(plaintext, serverPub []byte, temp *manualAuthTemp) ([]byte, error) {
+	return hybridECDHEncryptWithKey(plaintext, serverPub, nil, temp)
+}
+
+// hybridECDHEncryptWithKey 与 hybridECDHEncrypt 的差别只在多一路 encKey。
+//
+// encKey 是 ManualAuth 时服务端下发的 EncKey（24 字节）。带上它时，除了用
+// ECDH 协商出的密钥加密 CEK，还会用这把会话密钥再加密一次，写进字段 4。
+// 原生 AutoAuth 走的正是这条路：它复用已有会话密钥，不再走完整 ECDH 登录。
+func hybridECDHEncryptWithKey(plaintext, serverPub, encKey []byte, temp *manualAuthTemp) ([]byte, error) {
+	if len(encKey) != 0 && len(encKey) != 24 {
+		return nil, fmt.Errorf("invalid hybrid session key length")
+	}
 	eph, ephPub, err := generateECDH()
 	if err != nil {
 		return nil, err
@@ -188,9 +224,18 @@ func hybridECDHEncrypt(plaintext, serverPub []byte, temp *manualAuthTemp) ([]byt
 	if err != nil {
 		return nil, err
 	}
+	var encSession []byte
+	if len(encKey) > 0 {
+		encSession, err = aesGCMEncryptLayout(encKey, hash1[:], cek)
+		if err != nil {
+			return nil, err
+		}
+	}
 	prk := hkdfExtract(ilinkHKDFSalt, cek)
 	okm := hkdfExpand(prk, hash1[:], 56)
-	hash2 := sha256.Sum256(bytes.Join([][]byte{[]byte("1"), []byte("415"), ephPub, encCEK}, nil))
+	// encSession 必须进 hash2：它是本次请求的一部分，缺了它服务端算出的
+	// 哈希与我们对不上，验签也会失败。
+	hash2 := sha256.Sum256(bytes.Join([][]byte{[]byte("1"), []byte("415"), ephPub, encCEK, encSession}, nil))
 	comp := lz4AllLiteral(plaintext)
 	encBody, err := aesGCMEncryptLayout(okm[:24], hash2[:], comp)
 	if err != nil {
@@ -201,12 +246,13 @@ func hybridECDHEncrypt(plaintext, serverPub []byte, temp *manualAuthTemp) ([]byt
 		temp.Ephemeral = eph
 		temp.OKM = okm
 		temp.CompBody = comp
+		temp.RequestCipher = encBody
 	}
 	out := make([]byte, 0, len(ecdhKey)+len(encCEK)+len(encBody)+16)
 	out = append(out, pbVar(1, 1)...)
 	out = append(out, pbLen(2, ecdhKey)...)
 	out = append(out, pbLen(3, encCEK)...)
-	out = append(out, pbLen(4, nil)...)
+	out = append(out, pbLen(4, encSession)...)
 	out = append(out, pbLen(5, encBody)...)
 	return out, nil
 }
@@ -321,6 +367,14 @@ func hybridECDHDecrypt(response []byte, temp *manualAuthTemp) ([]byte, error) {
 
 func extractSession(mar []byte) (AppSession, error) {
 	F := pbParse(mar)
+	// 先读业务码：ManualAuth 被拒时响应里没有 f3 会话块，如果直接往下走，
+	// 真正的拒绝原因会被「missing f3」这种解析错误盖掉，
+	// 上层也就无从区分「票据被拒」和「响应格式不对」。
+	if base, ok := F[1].([]byte); ok {
+		if code, ok := pbParse(base)[1].(int64); ok && code != 0 {
+			return AppSession{}, &ManualAuthRejectedError{Code: code}
+		}
+	}
 	f3, ok := F[3].([]byte)
 	if !ok {
 		return AppSession{}, fmt.Errorf("ManualAuthResponse missing f3")
@@ -360,6 +414,18 @@ func sessionInfo(uin32 uint32, win, sessDevice []byte) []byte {
 	out = append(out, pbLen(5, win)...)
 	out = append(out, pbVar(6, 0)...)
 	return out
+}
+
+// sessionHostAppID 返回该会话应使用的产品身份，缺省回落应用宝。
+//
+// 所有发往微信的 JSAPI 请求都必须带上与会话一致的 host_appid：
+// 会话是用哪个渠道的授权建立的，请求就必须声明同一个产品，
+// 否则服务端会拿一个不存在的产品授权去校验，结果是莫名其妙的拒绝。
+func sessionHostAppID(hostAppID []byte) []byte {
+	if len(hostAppID) == 0 {
+		return hostAppIDDefault
+	}
+	return hostAppID
 }
 
 func buildJSAPIPlaintext(uin int64, appID string, transURL []byte, transCmdID uint64, loginReq []byte, hostAppID []byte, sessDevice []byte) []byte {
@@ -490,19 +556,38 @@ func parseRawResponse(codeOrJSON, resp []byte) map[string]any {
 	return protobufToMap(resp)
 }
 
-func buildPhoneRequest(uin int64, appID string, sessDevice []byte) []byte {
+// buildPhoneRequest 构造「获取手机号」请求。
+//
+// hostAppID 必须是**账号会话所属渠道**的 HostAppID，不能一律用应用宝的默认值：
+// 用应用宝身份去问一个电脑管家会话要手机号，等于让服务端去核对一个不存在的
+// 产品授权，只会拿到拒绝。两个渠道的原生构造也不一样（见下方注释）。
+// 设备标识由调用方传入：本项目按账号持久化（EnsureAccountDeviceID），
+// 同一账号的所有请求复用同一个指纹，避免设备信息频繁变动触发风控。
+func buildPhoneRequest(uin int64, appID string, hostAppID, sessDevice []byte) []byte {
 	aid := []byte(appID)
 	body := make([]byte, 0, 140)
 	body = append(body, pbLen(1, sessionInfo(uint32(uin), unifiedPCWindows, sessDevice))...)
 	body = append(body, pbLen(2, aid)...)
+	if string(hostAppID) == pcmgr.HostAppID {
+		// 电脑管家原生（WMPF 14673）走共享的 JSOperateWxDataRequest：
+		// 参数是 appid(2) + JSON(3)，命令号为 1141，而不是应用宝那套
+		// 字段 4/5/6/7 的兼容形态。
+		body = append(body, pbLen(3, []byte(`{"api_name":"webapi_getuserwxphone","data":{},"env":1}`))...)
+		return buildJSAPIPlaintext(uin, appID, phoneURL, 1141, body, hostAppID, sessDevice)
+	}
 	body = append(body, pbVar(4, 1)...)
 	body = append(body, pbLen(5, nil)...)
 	body = append(body, pbLen(6, nil)...)
 	body = append(body, pbVar(7, 1)...)
-	return buildJSAPIPlaintext(uin, appID, phoneURL, phoneCmdID, body, nil, sessDevice)
+	return buildJSAPIPlaintext(uin, appID, phoneURL, phoneCmdID, body, hostAppID, sessDevice)
 }
 
-func buildOperateRequest(uin int64, appID string, payload map[string]any, sessDevice []byte) ([]byte, error) {
+// buildOperateRequest 构造通用 operateWxData 转发请求。
+//
+// versionType（字段 6）在两个渠道下取值不同：电脑管家原生实现默认按正式版（1）发送，
+// 应用宝沿用 0。这不是「更正确」的问题，而是两边原生客户端本来就不同——
+// 混用会让服务端按错误的客户端类型解释整个请求。
+func buildOperateRequest(uin int64, appID string, payload map[string]any, hostAppID, sessDevice []byte) ([]byte, error) {
 	payload = extractOperatePayload(payload)
 	aid := []byte(appID)
 	f3, err := json.Marshal(payload)
@@ -515,8 +600,12 @@ func buildOperateRequest(uin int64, appID string, payload map[string]any, sessDe
 	body = append(body, pbLen(3, f3)...)
 	body = append(body, pbLen(4, nil)...)
 	body = append(body, pbVar(5, 0)...)
-	body = append(body, pbVar(6, 0)...)
-	return buildJSAPIPlaintext(uin, appID, operateURL, operateCmdID, body, nil, sessDevice), nil
+	versionType := uint64(0)
+	if string(hostAppID) == pcmgr.HostAppID {
+		versionType = 1
+	}
+	body = append(body, pbVar(6, versionType)...)
+	return buildJSAPIPlaintext(uin, appID, operateURL, operateCmdID, body, hostAppID, sessDevice), nil
 }
 
 func extractOperatePayload(raw map[string]any) map[string]any {

@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,6 +81,23 @@ func envWithFallback(keys ...string) string {
 // main 是程序入口，负责解析命令行参数与环境变量、初始化 App 实例、
 // 启动 HTTP 服务器，并监听系统信号以实现优雅关闭。
 func main() {
+	// .env 必须在任何 flag 注册之前加载：本程序所有 flag 的默认值都取自环境变量，
+	// 注册之后再读文件，文件里的配置就对默认值无能为力了。
+	explicitEnvFile := prescanEnvFile(os.Args[1:])
+	if path := resolveEnvFile(explicitEnvFile); path != "" {
+		if err := loadEnvFile(path, os.Stderr); err != nil {
+			// 显式指定却读不了要报错退出；自动发现失败只提示，不阻止启动
+			if explicitEnvFile != "" {
+				fmt.Fprintln(os.Stderr, "加载 .env 失败："+err.Error())
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "提示："+err.Error())
+		}
+	} else if explicitEnvFile != "" {
+		fmt.Fprintln(os.Stderr, "加载 .env 失败：指定的文件不存在："+explicitEnvFile)
+		os.Exit(1)
+	}
+
 	// 解析命令行参数；默认值优先取环境变量，保证容器场景零参数启动
 	host := flag.String("host", envOr("YYB_BIND_ADDRESS", "0.0.0.0"), "监听地址")
 	port := flag.Int("port", envInt("YYB_PORT", 8000), "监听端口")
@@ -93,14 +111,19 @@ func main() {
 		"管理员认证数据库文件名，位于 data-root/db 下")
 	tcpProxy := flag.String("tcp-proxy", envOr("YYB_TCP_PROXY", ""),
 		"可选 TCP 代理: socks5://host:port 或 http-connect://host:port")
-	checkInterval := flag.Int("check-interval", envInt("YYB_CHECK_INTERVAL", 1800),
-		"后台健康检查间隔(秒)，设 0 禁用")
+	// 默认值对齐官方客户端：每 2 分钟检查一次、提前 4 分钟续期。
+	// 提前量从 45 分钟收到 4 分钟是有意的——续期越贴近真实到期点，
+	// 单位时间内发起的刷新次数越少，被上游当成异常行为的概率也越低。
+	checkInterval := flag.Int("check-interval", envInt("YYB_CHECK_INTERVAL", 0),
+		"后台健康检查间隔(秒)，默认 0 禁用；保活已覆盖到期检查，除非需要额外兜底再打开")
 	checkStale := flag.Int("check-stale", envInt("YYB_CHECK_STALE", 3600),
-		"账号未检查超过此时长(秒)视为过期并触发刷新")
-	keepAliveInterval := flag.Int("keepalive-interval", envInt("YYB_KEEPALIVE_INTERVAL", 60),
+		"账号未检查超过此时长(秒)视为过期并触发刷新（仅 check-interval>0 时生效）")
+	keepAliveInterval := flag.Int("keepalive-interval", envInt("YYB_KEEPALIVE_INTERVAL", 120),
 		"凭据保活扫描间隔(秒)，设 0 禁用")
-	keepAliveAhead := flag.Int("keepalive-ahead", envInt("YYB_KEEPALIVE_AHEAD", 2700),
+	keepAliveAhead := flag.Int("keepalive-ahead", envInt("YYB_KEEPALIVE_AHEAD", 240),
 		"凭据剩余有效期低于此秒数时提前续期")
+	enablePCLogin := flag.Bool("enable-pc-login", envBool("YYB_ENABLE_PC_LOGIN", false),
+		"开启本机微信授权（quick-login）；仅 Windows 客户端场景有意义")
 	sessionHours := flag.Int("session-hours", envInt("YYB_SESSION_HOURS", 168),
 		"管理员登录会话有效期(小时)")
 	protocolToken := flag.String("protocol-token", envOr("YYB_PROTOCOL_TOKEN", ""),
@@ -109,7 +132,32 @@ func main() {
 		"为会话 Cookie 加 Secure 标记（HTTPS 部署时开启）")
 	trustProxy := flag.Bool("trust-proxy", envBool("YYB_TRUST_PROXY", false),
 		"信任反向代理传来的 X-Forwarded-For/X-Real-IP（仅部署在可信代理后面时开启）")
+	// 本地口令恢复：给出用户名后读完口令即退出，不启动服务。
+	// 这是「口令彻底忘了」时唯一的自救通道，只改认证库，不碰业务库。
+	flag.String(envFileName, envOr("YYB_ENV_FILE", ""),
+		"dotenv 文件路径；留空则依次尝试可执行文件同目录与当前目录下的 .env（先于其它 flag 生效）")
+	resetAdminUser := flag.String("reset-admin-password", envOr("YYB_RESET_ADMIN_PASSWORD", ""),
+		"本地重置指定管理员的口令后退出（口令从标准输入读取；不会新建数据库）")
 	flag.Parse()
+
+	// 是否显式指定了资源根：命令行 --resource-root，或环境变量 / .env 里的
+	// YYB_RESOURCE_ROOT。任一为真都说明部署方自己准备了一份 resource 目录，
+	// 那就以他的文件为准；否则用二进制内嵌的那一份（独立二进制场景）。
+	// 上游只看 flag.Visit，环境变量指定的部署反而会退回去用内嵌资源，这里补上。
+	resourceRootExplicit := strings.TrimSpace(envOr("YYB_RESOURCE_ROOT", "")) != ""
+	flag.Visit(func(current *flag.Flag) {
+		if current.Name == "resource-root" {
+			resourceRootExplicit = true
+		}
+	})
+
+	// 自定义 DNS：必须在任何解析发生之前装好，所以紧跟 flag.Parse()。
+	// 部署环境的系统 DNS 解析不到微信/应用宝域名时才需要配，留空则什么都不做。
+	if dnsServers, err := configureDNS(envOr("YYB_DNS_SERVERS", "")); err != nil {
+		log.Fatalf("配置 DNS 失败: %v", err)
+	} else if len(dnsServers) > 0 {
+		log.Printf("[dns] 已使用指定 DNS 服务器: %s", strings.Join(dnsServers, ", "))
+	}
 
 	// 管理员可通过环境变量预设，避免首次启动必须人工访问 /setup
 	adminUser := envWithFallback("YYB_ADMIN_USER", "YYB_WEB_USER")
@@ -119,6 +167,7 @@ func main() {
 	cfg := httpapi.Config{
 		ResourceRoot:      *resourceRoot,
 		DataRoot:          *dataRoot,
+		EmbeddedWebAssets: !resourceRootExplicit,
 		DBFilename:        *dbFilename,
 		AuthDBFilename:    *authDBFilename,
 		TCPProxy:          *tcpProxy,
@@ -130,12 +179,24 @@ func main() {
 		CheckStale:        time.Duration(*checkStale) * time.Second,
 		KeepAliveInterval: time.Duration(*keepAliveInterval) * time.Second,
 		KeepAliveAhead:    time.Duration(*keepAliveAhead) * time.Second,
+		EnablePCLogin:     *enablePCLogin,
 		SessionDuration:   time.Duration(*sessionHours) * time.Hour,
 		CookieSecure:      *cookieSecure,
 		ProtocolToken:     *protocolToken,
 		TrustProxy:        *trustProxy,
 		AdminUser:         adminUser,
 		AdminPassword:     adminPassword,
+	}
+
+	// 口令恢复模式：不初始化 App、不打开业务库、不监听端口。
+	// 走这条路时任何有副作用的初始化都可能把事情弄得更糟
+	// （例如误建一个空数据库，让服务下次启动读到一个没有账号的新库）。
+	if *resetAdminUser != "" {
+		if err := resetAdminPassword(cfg, *resetAdminUser, os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "重置失败："+err.Error())
+			os.Exit(1)
+		}
+		return
 	}
 
 	// 初始化 App（数据库、资源目录、连接池、认证库等）

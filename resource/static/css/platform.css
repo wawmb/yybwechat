@@ -1,0 +1,176 @@
+/* =============================================================================
+   yybwechat 控制台 — 外壳层（侧栏 + 顶栏）
+   =============================================================================
+
+   这一层只负责「页面之外」的框架：左侧导航、顶栏、用户区、移动端抽屉。
+   页面内容样式全部在 console.css 里，这里不重新定义任何颜色字面值——
+   深色主题靠同一套 token 生效。
+
+   历史原因：这一层原来自带一套 --platform-* 固定色板，于是日志页在主色、
+   圆角、字号上都跟控制台对不上，而且完全没有深色主题（顶栏依旧白底）。
+   ============================================================================= */
+
+/* 唯一一条自有变量：外壳的分割线就是全站的分割线，没必要再定义一层 */
+:root { --platform-line: var(--line); }
+
+body.platform-ready { background: var(--bg); }
+
+.platform-shell { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100vh; }
+
+/* ---------------- 左侧栏 ---------------- */
+.platform-sidebar {
+  position: sticky; top: 0; align-self: start;
+  display: flex; flex-direction: column;
+  height: 100vh; padding: 16px 12px 12px;
+  background: var(--surface);
+  border-right: 1px solid var(--platform-line);
+}
+
+.platform-brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px 18px; }
+.platform-brand-mark {
+  display: grid; place-items: center;
+  width: 30px; height: 30px; border-radius: 9px;
+  background: var(--grad-brand); color: #fff;
+  font-size: 15px; font-weight: 700;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.35), 0 2px 6px -1px oklch(0.45 0.16 275 / 0.45);
+}
+.platform-brand-copy strong { display: block; font-size: 13.5px; font-weight: 650; letter-spacing: -0.01em; }
+.platform-brand-copy span { display: block; font-size: 11px; color: var(--faint); }
+
+.platform-nav { display: flex; flex-direction: column; gap: 18px; overflow-y: auto; }
+.platform-nav-group {
+  padding: 0 8px 6px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--faint);
+}
+.platform-nav a {
+  position: relative;
+  display: flex; align-items: center; gap: 9px;
+  height: 32px; padding: 0 9px;
+  border-radius: var(--radius);
+  color: var(--muted); font-size: 12.5px;
+  transition: background 120ms, color 120ms;
+}
+.platform-nav a svg { width: 15px; height: 15px; flex: none; opacity: 0.75; }
+.platform-nav a:hover { background: var(--surface-strong); color: var(--ink); }
+.platform-nav a[aria-current="page"] {
+  background: var(--primary-soft); color: var(--primary); font-weight: 550;
+}
+.platform-nav a[aria-current="page"] svg { opacity: 1; }
+.platform-nav a[aria-current="page"]::before {
+  content: ""; position: absolute; left: -12px; top: 6px; bottom: 6px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--primary);
+}
+
+.platform-sidebar-foot { margin-top: auto; padding-top: 14px; display: grid; gap: 10px; }
+.platform-nav a[hidden], .platform-sidebar-foot[hidden] { display: none; }
+.platform-service {
+  display: grid; gap: 6px; padding: 10px 11px;
+  border: 1px solid var(--platform-line); border-radius: var(--radius-md);
+  background: var(--surface-2);
+}
+.platform-service-row { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 550; }
+.platform-service small { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.platform-me {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 9px; border-radius: var(--radius-md);
+  transition: background 120ms;
+}
+.platform-me:hover { background: var(--surface-strong); }
+.platform-me-copy { min-width: 0; }
+.platform-me-copy strong { display: block; font-size: 12.5px; font-weight: 600; }
+.platform-me-copy span { display: block; font-size: 11px; color: var(--faint); }
+.platform-me .icon-btn { margin-left: auto; }
+.platform-avatar {
+  display: grid; place-items: center; flex: none;
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--surface-strong); color: var(--muted);
+  font-size: 11.5px; font-weight: 650; border: 1px solid var(--platform-line);
+}
+
+/* ---------------- 顶栏 ---------------- */
+.platform-stage { display: flex; flex-direction: column; min-width: 0; }
+.platform-topbar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 12px;
+  height: 52px; padding: 0 24px;
+  background: color-mix(in oklab, var(--bg) 82%, transparent);
+  backdrop-filter: saturate(140%) blur(10px);
+  border-bottom: 1px solid var(--platform-line);
+}
+.platform-topbar-left { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+.platform-page-context { min-width: 0; }
+.platform-breadcrumb { font-size: 11.5px; color: var(--faint); }
+.platform-breadcrumb b { color: var(--muted); font-weight: 550; }
+.platform-page-title {
+  margin: 0; font-size: 15px; font-weight: 620; letter-spacing: -0.01em;
+  max-width: 46vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.platform-menu {
+  display: none; width: 30px; height: 30px;
+  border: 0; border-radius: var(--radius); background: transparent;
+  color: var(--muted); font-size: 15px; cursor: pointer;
+}
+.platform-menu:hover { background: var(--surface-strong); }
+
+/* 页面自带的操作按钮被搬进这里；它是顶栏的**直接子元素**，
+   移动端才能整行折到第二行横向滚动（嵌在用户组里 order 只在组内生效）。 */
+.platform-actions { display: flex; align-items: center; gap: 8px; }
+.platform-actions:empty { display: none; }
+.platform-user { display: flex; align-items: center; gap: 6px; }
+.platform-divider { width: 1px; height: 20px; background: var(--platform-line); }
+.platform-user .platform-divider { display: none; }
+.platform-actions:not(:empty) + .platform-user .platform-divider { display: block; }
+.platform-user-copy { text-align: right; line-height: 1.25; }
+.platform-user-copy strong { display: block; font-size: 12.5px; font-weight: 600; }
+.platform-user-copy span { display: block; font-size: 11px; color: var(--faint); }
+.platform-version {
+  display: flex; align-items: center; gap: 6px;
+  height: 30px; padding: 0 9px;
+  border: 1px solid var(--platform-line); border-radius: var(--radius);
+  background: var(--surface); color: var(--muted);
+  font-size: 11.5px; font-variant-numeric: tabular-nums;
+}
+.platform-version b { font-weight: 600; color: var(--ink); }
+
+/* 内容区：给页面留出统一的左右留白。
+   页面自己只管「内容怎么排」，不再各写一份 .shell 宽度。 */
+.platform-main { display: block; padding: 20px 24px 40px; }
+.platform-main > main { display: block; }
+
+/* ---------------- 移动端抽屉 ---------------- */
+.platform-overlay { display: none; }
+
+@media (max-width: 900px) {
+  .platform-shell { grid-template-columns: minmax(0, 1fr); }
+  .platform-sidebar {
+    position: sticky; top: 0; z-index: 30; height: auto;
+    flex-direction: row; align-items: center; gap: 12px;
+    padding: 8px 12px; overflow-x: auto;
+    border-right: 0; border-bottom: 1px solid var(--platform-line);
+  }
+  .platform-brand { padding: 0; flex: none; }
+  .platform-brand-copy { display: none; }
+  .platform-nav { flex-direction: row; gap: 4px; overflow: visible; }
+  .platform-nav-section { display: flex; align-items: center; gap: 4px; }
+  .platform-nav-group { display: none; }
+  .platform-nav a { height: 30px; padding: 0 10px; }
+  .platform-nav a[aria-current="page"]::before { display: none; }
+  /* 窄屏导航只留图标：长词在 30px 高的条里会竖排换行 */
+  .platform-nav-label { display: none; }
+  .platform-nav a svg { width: 16px; height: 16px; }
+  .platform-sidebar-foot { margin: 0 0 0 auto; padding: 0; display: flex; align-items: center; }
+  .platform-service { display: none; }
+  .platform-me-copy { display: none; }
+  .platform-topbar { padding: 0 14px; }
+  .platform-breadcrumb { display: none; }
+  .platform-page-title { max-width: 60vw; }
+  .platform-actions { order: 3; width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+  .platform-user-copy { display: none; }
+  .platform-main { padding: 16px 14px 32px; }
+}
+
+@media (max-width: 720px) {
+  .platform-version span { display: none; }
+}
