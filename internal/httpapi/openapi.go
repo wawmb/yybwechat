@@ -85,6 +85,145 @@ func newOpenAPISpec() map[string]any {
 					}),
 				),
 			},
+			"/qr/{session_id}/cancel": map[string]any{
+				"post": openAPIOperation(
+					[]string{"qr"},
+					"主动取消一张二维码会话（「重新生成」时先调用它，避免迟到的轮询/确认把上一张二维码的扫码结果补完）",
+					[]map[string]any{pathStringParam("session_id", "二维码会话 ID。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("会话已取消（对不存在的会话幂等返回）。", nil),
+					}),
+				),
+				"delete": openAPIOperation(
+					[]string{"qr"},
+					"取消二维码会话（与 POST 等价）",
+					[]map[string]any{pathStringParam("session_id", "二维码会话 ID。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("会话已取消。", nil),
+					}),
+				),
+			},
+			"/wx/qrcodeauth": map[string]any{
+				"post": openAPIOperation(
+					[]string{"qr"},
+					"早期脚本使用的扫码入口，行为与 /qr 完全一致（子路径 /image、/poll、/confirm、/cancel 同样可用）",
+					[]map[string]any{boolQueryParam("as_base64", "是否同时返回二维码图片的 data URI。")},
+					jsonOptionalRequestBody(refSchema("QRCreateRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("二维码会话创建成功。", refSchema("QRCreateResponse")),
+					}),
+				),
+			},
+			"/account-link/{token}": map[string]any{
+				"get": openAPIOperation(
+					[]string{"account-links"},
+					"一次性授权链接的公开页面（免登录，链接本身就是凭证；token 只能使用一次）",
+					[]map[string]any{pathStringParam("token", "签发时生成的 32 位令牌。")},
+					nil,
+					defaulted(map[string]any{
+						"200": htmlResponse("链接专用扫码页面。"),
+						"410": jsonResponse("链接已失效、已使用或不存在。", nil),
+					}),
+				),
+			},
+			"/account-link/{token}/qr": map[string]any{
+				"post": openAPIOperation(
+					[]string{"account-links"},
+					"为这条链接创建二维码会话（公开接口）",
+					[]map[string]any{pathStringParam("token", "签发时生成的 32 位令牌。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("二维码会话创建成功。", refSchema("QRCreateResponse")),
+					}),
+				),
+			},
+			"/account-link/{token}/meta": map[string]any{
+				"get": openAPIOperation(
+					[]string{"account-links"},
+					"读取这条链接的展示信息：目标账号、扫码渠道、是否为跨渠道切换",
+					[]map[string]any{pathStringParam("token", "签发时生成的 32 位令牌。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("链接展示信息。", nil),
+					}),
+				),
+			},
+			"/api/account-links": map[string]any{
+				"get": openAPIOperation(
+					[]string{"account-links"},
+					"列出全部一次性授权链接及各状态计数",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("链接列表与计数。", nil),
+					}),
+				),
+				"post": openAPIOperation(
+					[]string{"account-links"},
+					"为账号签发一条一次性授权链接。kind=update 用原微信换掉该账号授权；kind=add 让别人的微信新增一个账号。同一账号同类型只允许一条未使用链接",
+					nil,
+					jsonRequestBody(refSchema("AccountLinkCreateRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("签发成功，data.url 就是发给对方的地址。", nil),
+						"409": jsonResponse("该账号已有未使用的同类型链接，响应里带 existing 列表。", nil),
+					}),
+				),
+			},
+			"/api/account-links/{id}/revoke": map[string]any{
+				"post": openAPIOperation(
+					[]string{"account-links"},
+					"作废指定链接（立即失效，不能恢复）",
+					[]map[string]any{pathStringParam("id", "链接 ID。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("已作废。", nil),
+					}),
+				),
+			},
+			"/api/account-links/{id}": map[string]any{
+				"delete": openAPIOperation(
+					[]string{"account-links"},
+					"删除链接记录（只清本地记录，已发出的地址同样失效）",
+					[]map[string]any{pathStringParam("id", "链接 ID。")},
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("已删除。", nil),
+					}),
+				),
+			},
+			"/api/scan-settings": map[string]any{
+				"get": openAPIOperation(
+					[]string{"settings"},
+					"读取系统默认扫码渠道",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("当前默认渠道。", nil),
+					}),
+				),
+				"post": openAPIOperation(
+					[]string{"settings"},
+					"设置系统默认扫码渠道（appstore 或 pcmgr）。已存在的账号重扫时一律沿用其原渠道，不受此设置影响",
+					nil,
+					jsonRequestBody(refSchema("ScanSettingsRequest")),
+					defaulted(map[string]any{
+						"200": jsonResponse("更新后的默认渠道。", nil),
+					}),
+				),
+			},
+			"/quick-login": map[string]any{
+				"post": openAPIOperation(
+					[]string{"qr"},
+					"创建「本机微信授权」会话（仅 Windows 且开启 --enable-pc-login 时可用，否则返回 404）",
+					nil,
+					nil,
+					defaulted(map[string]any{
+						"200": jsonResponse("会话创建成功。", nil),
+					}),
+				),
+			},
 			"/accounts": map[string]any{
 				"get": openAPIOperation(
 					[]string{"accounts"},
@@ -565,9 +704,15 @@ func newOpenAPISpec() map[string]any {
 					"image_base64": nullableStringSchema("二维码图片 data URI。始终包含，但仅当 as_base64=true 时为非 null 值。"),
 				}),
 				"QRPollResponse": objectSchema([]string{"status"}, map[string]any{
+					"session_id": map[string]any{
+						"type":        "string",
+						"description": "仅在 status=cancelled 时随响应返回，方便前端确认是哪张码被取消。",
+					},
 					"status": map[string]any{
 						"type": "string",
 						"enum": []string{"pending", "scanned", "authorized", "confirmed", "expired", "cancelled", "unknown"},
+						"description": "扫码进展。cancelled 表示这张码被用户主动放弃（调过 /qr/{id}/cancel，「重新生成」时如此），" +
+							"与 expired/unknown 一样是终态；它只在取消后的一个会话 TTL 内返回，超过窗口再轮询会变成 404。",
 					},
 					"errcode": map[string]any{"type": "integer", "nullable": true},
 				}),
@@ -686,6 +831,16 @@ func newOpenAPISpec() map[string]any {
 				"AccountStatusRequest": objectSchema([]string{"ref", "status"}, map[string]any{
 					"ref":    map[string]any{"type": "string", "description": "账号 ID、UIN 或 openid。"},
 					"status": map[string]any{"type": "string", "description": "目标状态，仅接受 alive 或 expired。"},
+				}),
+				"AccountLinkCreateRequest": objectSchema([]string{"kind", "ref"}, map[string]any{
+					"kind":           map[string]any{"type": "string", "description": "update：用原微信扫码换掉该账号授权；add：让别人的微信扫码新增一个账号。"},
+					"ref":            map[string]any{"type": "string", "description": "参照账号（ID、UIN 或 openid）：决定默认渠道，add 时新账号会复制它的代理配置。"},
+					"ttl_seconds":    map[string]any{"type": "integer", "description": "有效期秒数，60 ~ 604800。缺省：update 10 分钟，add 30 分钟。"},
+					"product":        map[string]any{"type": "string", "description": "扫码渠道 appstore / pcmgr。update 缺省沿用账号原渠道。"},
+					"confirm_switch": map[string]any{"type": "boolean", "description": "update 且渠道与账号原渠道不同时必须为 true，否则 422。"},
+				}),
+				"ScanSettingsRequest": objectSchema([]string{"default_product"}, map[string]any{
+					"default_product": map[string]any{"type": "string", "description": "默认扫码渠道：appstore 或 pcmgr。"},
 				}),
 				"AccountConfirmRequest": objectSchema(nil, map[string]any{
 					"confirm": map[string]any{"type": "boolean", "description": "false 仅预览影响范围，true 才真正执行。"},
@@ -809,6 +964,18 @@ func imageResponse(description string) map[string]any {
 		"content": map[string]any{
 			"image/jpeg": map[string]any{
 				"schema": map[string]any{"type": "string", "format": "binary"},
+			},
+		},
+	}
+}
+
+// htmlResponse 描述一个返回 HTML 的响应（公开短链页这类页面型接口）。
+func htmlResponse(description string) map[string]any {
+	return map[string]any{
+		"description": description,
+		"content": map[string]any{
+			"text/html": map[string]any{
+				"schema": map[string]any{"type": "string"},
 			},
 		},
 	}

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -25,6 +26,12 @@ func newKeepAliveTestApp(t *testing.T) *App {
 	})
 	if err != nil {
 		t.Fatalf("NewApp() error = %v", err)
+	}
+	// legacy_auth 刷新入口遇到 -109 会补一次官方 check-login。测试里必须
+	// 把它换成不发网络请求的实现：真实客户端会去打微信接口，拿到 42007
+	// 之后账号就被判定为终态，用例会因为「跑了真网络」而随环境飘。
+	app.checkLogin = func(context.Context, protocol.LoginBufferCredentials) (protocol.LoginBufferCredentials, error) {
+		return protocol.LoginBufferCredentials{}, errors.New("check login disabled in tests")
 	}
 	// 不注册 t.Cleanup：上游这些用例自己 defer app.Close()，
 	// 重复关闭会重复 close(stopHealth) 而 panic。

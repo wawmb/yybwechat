@@ -192,6 +192,42 @@ func migrateAddRemark(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+// migrateAccountLinksColumns 为旧库的 account_links 补齐后加的列。
+//
+// 建表语句后来加了「跨渠道」相关列（target_product / switch_confirmed）以及
+// 明文副本、作废时间、归属人，但 CREATE TABLE IF NOT EXISTS 对已存在的表
+// 什么也不做——老库直接升级上来，SELECT 会报 no such column，
+// 短链的列表 / 签发 / 公网页面会一起 500。
+//
+// 每一列都先查 pragma 再决定是否 ALTER，重复执行安全。
+func migrateAccountLinksColumns(ctx context.Context, db *sql.DB) error {
+	exists, err := sqliteTableExists(ctx, db, "account_links")
+	if err != nil || !exists {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"token_ciphertext", "TEXT NOT NULL DEFAULT ''"},
+		{"owner_user_id", "INTEGER"},
+		{"revoked_at", "INTEGER"},
+		{"target_product", "TEXT NOT NULL DEFAULT ''"},
+		{"switch_confirmed", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		var n int
+		if err = db.QueryRowContext(ctx,
+			"SELECT count(*) FROM pragma_table_info('account_links') WHERE name=?", column.name).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			continue
+		}
+		if _, err = db.ExecContext(ctx,
+			"ALTER TABLE account_links ADD COLUMN "+column.name+" "+column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SetAccountRemark 更新指定账号的备注，返回更新后的账号。
 // 传入空字符串表示清除备注，数据库中以 NULL 存储。
 func (db *DB) SetAccountRemark(ctx context.Context, id int64, remark string) (*WechatAccount, error) {

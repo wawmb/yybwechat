@@ -44,6 +44,14 @@ type Config struct {
 	MaxLoginConcurrency     int
 	TCPProxy                string
 	TCPProxyFallbackDirect  bool
+	// DeviceIdentity 取 DeviceIdentityStable（每个账号固定一套设备）或
+	// DeviceIdentityRandom（历史行为：每次登录/请求都换新设备）。
+	DeviceIdentity string
+	// LoginBudget 限制「业务请求能让 OAuth 层干活」的次数：取新票据、
+	// 用票据做 ManualAuth、强制刷新都算。窗口内用完就拒绝，请求保留它原本的错误。
+	// 0 表示关闭（DefaultConfig 就是 0，由服务层传入默认值）。
+	LoginBudget int
+	LoginWindow time.Duration
 }
 
 // DefaultConfig 返回协议连接池的默认配置。
@@ -56,6 +64,7 @@ func DefaultConfig() Config {
 		MaxShortlinkConcurrency: 1000,
 		MaxLoginConcurrency:     32,
 		TCPProxyFallbackDirect:  true,
+		DeviceIdentity:          DeviceIdentityStable,
 	}
 }
 
@@ -101,12 +110,21 @@ type Pool struct {
 	// codeLocks 让同一账号的 wx.login 串行执行。
 	// 一次性 code 在并发消费时会互相作废，不同账号之间仍然可以并行。
 	codeLocks map[int64]*keyLock
-	// codeRepairs 记录「同账号+出口」最近一次取码恢复的尝试时间。
+	// codeRepairs 记录「同账号+出口+AppID」最近一次取码恢复的尝试时间。
 	// 失败后 5 分钟内不再重试，避免一次卡住的旧会话把请求放大成持续重登录。
 	codeRepairs map[string]codeRepairAttempt
+	// verified 记录每条会话最后一次成功取到 code 的时刻：紧接着的 -14
+	// 只可能是该 AppID 自身被拒，不该再触发一次重新登录。
+	verified map[string]verifiedSession
+	// budget 限制业务流量能在窗口内让 OAuth 层干多少次活。
+	budget *loginBudget
 	// events 是运行日志。可为 nil（例如测试或未启用日志时），
 	// eventlog.Logger 的所有方法都对 nil 接收者安全。
 	events *eventlog.Logger
+
+	// deviceSeedMu / deviceSeedValue 缓存实例级设备种子（落库，重启不变）。
+	deviceSeedMu    sync.Mutex
+	deviceSeedValue []byte
 
 	loginSem     chan struct{}
 	shortlinkSem chan struct{}
@@ -127,6 +145,9 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	if cfg.DNSCacheTTL == 0 {
 		cfg.DNSCacheTTL = def.DNSCacheTTL
 	}
+	if cfg.DeviceIdentity == "" {
+		cfg.DeviceIdentity = def.DeviceIdentity
+	}
 	if cfg.MaxShortlinkConcurrency == 0 {
 		cfg.MaxShortlinkConcurrency = def.MaxShortlinkConcurrency
 	}
@@ -139,6 +160,8 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 		locks:        map[string]*keyLock{},
 		codeLocks:    map[int64]*keyLock{},
 		codeRepairs:  map[string]codeRepairAttempt{},
+		verified:     map[string]verifiedSession{},
+		budget:       newLoginBudget(cfg.LoginBudget, cfg.LoginWindow),
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
 	}
@@ -178,9 +201,15 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 		if err != nil {
 			return nil, err
 		}
+		// 只有拿到非空 code 才算「这条会话被验证过」。空 code 说明这个应用
+		// 取不到码，不代表会话可用——拿它当证据会让随后的会话级 -14 被误判成
+		// 目标级拒绝，从而跳过本该做的恢复。
+		if len(code) > 0 {
+			p.markSessionVerified(firstAccount(expected), accountID, st)
+		}
 		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
 	}
-	return retryLoginCode(ctx, func() (map[string]any, error) {
+	result, err := retryLoginCode(ctx, func() (map[string]any, error) {
 		return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, call, expected...)
 	}, func() error {
 		if err := p.invalidateExpected(ctx, accountID, tcpProxy, expected...); err != nil {
@@ -191,6 +220,7 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 		}
 		return nil
 	})
+	return result, err
 }
 
 // retryLoginCode 在拿到空 code 或短连接载荷异常时重建会话并重试一次。
@@ -230,7 +260,7 @@ func retryLoginCode(ctx context.Context, call func() (map[string]any, error), in
 
 // GetPhoneNumber 通过 MMTLS 短连接获取用户手机号。
 func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+	result, err := p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		sessDevice, err := p.ensureSessDevice(ctx, accountID)
 		if err != nil {
 			return nil, err
@@ -249,11 +279,14 @@ func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, ac
 		}
 		return parseRawResponse(code, resp), nil
 	}, expected...)
+	// 取号 / 转发成功**不**算「会话已验证」：它们的响应体可以带业务错误，
+	// Go 层无 error 并不代表这条会话能取到 wx.login code。
+	return result, err
 }
 
 // OperateWXData 通过 MMTLS 短连接代理小程序云函数调用。
 func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, payload map[string]any, accountID int64, tcpProxy string, fallbackDirect bool, expected ...*store.WechatAccount) (map[string]any, error) {
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+	result, err := p.run(ctx, loginBuffer, accountID, tcpProxy, fallbackDirect, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		sessDevice, err := p.ensureSessDevice(ctx, accountID)
 		if err != nil {
 			return nil, err
@@ -272,6 +305,9 @@ func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, pay
 		}
 		return parseRawResponse(code, resp), nil
 	}, expected...)
+	// 取号 / 转发成功**不**算「会话已验证」：它们的响应体可以带业务错误，
+	// Go 层无 error 并不代表这条会话能取到 wx.login code。
+	return result, err
 }
 
 // Invalidate 删除指定账号在指定代理下的会话。
@@ -443,6 +479,9 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	if len(expected) > 0 && !acc.SameAuthorization(expected[0]) {
 		return WmpfSession{}, store.ErrAccountAuthorizationChanged
 	}
+	// 同账号固定一套设备：ManualAuth 的 AppDeviceId 由此派生，
+	// 不再每次登录都换一台「新机器」。禁用时返回空值，登录处回落到随机。
+	device := p.deviceFor(ctx, acc)
 	// 完整 ManualAuth 之前先试一次独立原生恢复：它不需要 OAuth 凭据，
 	// 只用 ManualAuth 时保存的设备 + AutoKey + EncKey，因此即便授权已被拒
 	// （session_only）也仍然可能成功。
@@ -461,7 +500,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 		return WmpfSession{}, err
 	}
 	defer release(p.loginSem)
-	st, err := p.loginAndSession(ctx, loginBuffer, tcpProxy, fallbackDirect)
+	st, err := p.loginAndSession(ctx, loginBuffer, tcpProxy, fallbackDirect, device)
 	if err != nil {
 		return WmpfSession{}, err
 	}
@@ -524,7 +563,7 @@ func dropScoped[K comparable](mu *sync.Mutex, table map[K]*keyLock, key K, entry
 	mu.Unlock()
 }
 
-func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string, fallbackDirect bool) (WmpfSession, error) {
+func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string, fallbackDirect bool, device DeviceIdentity) (WmpfSession, error) {
 	if loginBuffer == "" {
 		return WmpfSession{}, fmt.Errorf("login_buffer is empty")
 	}
@@ -544,7 +583,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 			return WmpfSession{}, err
 		}
 		defer mc.close()
-		return p.doLoginOnConn(mc, loginBuffer)
+		return p.doLoginOnConn(mc, loginBuffer, device)
 	})
 	if err != nil {
 		return WmpfSession{}, err
@@ -595,14 +634,18 @@ func tryLonglinkCandidates(ctx context.Context, targets []Target, timeout time.D
 }
 
 // doLoginOnConn 在已建立的 MMTLS 连接上完成 ManualAuth 登录握手。
-func (p *Pool) doLoginOnConn(mc *mmtlsClient, loginBuffer string) (WmpfSession, error) {
+func (p *Pool) doLoginOnConn(mc *mmtlsClient, loginBuffer string, device DeviceIdentity) (WmpfSession, error) {
 	meta, err := parseLoginBuffer(loginBuffer)
 	if err != nil {
 		return WmpfSession{}, err
 	}
-	appDeviceID, err := randomAppDeviceID()
-	if err != nil {
-		return WmpfSession{}, err
+	// 稳定设备标识开启时用派生的 AppDeviceId；关闭（或种子读不到）时保持
+	// 历史行为，每次登录换一个随机值。
+	appDeviceID := append([]byte(nil), device.AppDeviceID...)
+	if len(appDeviceID) == 0 {
+		if appDeviceID, err = randomAppDeviceID(); err != nil {
+			return WmpfSession{}, err
+		}
 	}
 	temp := &manualAuthTemp{}
 	body, err := buildLoginBody(loginBuffer, meta.DeviceID, appDeviceID, temp)

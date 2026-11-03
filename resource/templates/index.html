@@ -131,7 +131,7 @@
       </section>
 
       <!-- 账号：从卡片流改成表格，一行一个号，操作悬停才出现 -->
-      <section class="card">
+      <section class="card" id="accountWorkspace">
         <div class="card-head">
           <h2>账号</h2>
           <span class="hint">点击行选中，悬停显示操作</span>
@@ -160,7 +160,7 @@
       </section>
 
       <!-- 调用工作区：左边配置，右边结果 -->
-      <section class="split">
+      <section class="split" id="callWorkspace">
         <div class="card">
           <div class="card-head">
             <h2>调用配置</h2>
@@ -435,6 +435,26 @@
       updateTestCommand();
     }
 
+    // 「我的控制台 / 我的微信账号 / 接口测试」是同一个页面的三个视图（/?focus=…）。
+    // 视图之间切换由外壳在同文档内完成（不重载），这里只负责首屏按地址栏滚到对应区块。
+    function scrollToWorkspaceFocus() {
+      const focus = new URLSearchParams(location.search).get("focus");
+      const target = focus === "accounts" ? $("accountWorkspace")
+        : focus === "test" ? $("callWorkspace") : null;
+      if (target) target.scrollIntoView({ block: "start" });
+    }
+
+    // 地址栏上的 ?ref= 指向具体账号（ID 或 openid），前进/后退时按它恢复选中项。
+    // 没有 ref 就什么都不做：URL 没指向账号时不该把用户当前的选中项悄悄重置成第一个。
+    function selectAccountFromURL() {
+      const ref = new URLSearchParams(location.search).get("ref");
+      if (!ref) return;
+      const account = state.accounts.find(a => String(a.id) === ref || a.openid === ref);
+      if (!account || account.openid === state.selectedOpenID) return;
+      state.selectedOpenID = account.openid;
+      syncSelectedAccount();
+    }
+
     function renderStats() {
       const by = status => state.accounts.filter(a => a.status === status).length;
       $("accountCount").textContent = String(state.accounts.length);
@@ -467,6 +487,8 @@
       status: '<path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2.2"/><circle cx="9" cy="16" r="2.2"/>',
       proxy: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.3 3.6 5.2 3.6 8.5S14.4 18.2 12 20.5c-2.4-2.3-3.6-5.2-3.6-8.5S9.6 5.8 12 3.5z"/>',
       link: '<path d="M10.5 13.5a4.5 4.5 0 0 0 6.4.1l1.8-1.8a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M13.5 10.5a4.5 4.5 0 0 0-6.4-.1l-1.8 1.8a4.5 4.5 0 0 0 6.4 6.4l1-1"/>',
+      // 「新增链接」= 链接 + 加号，与「更新链接」区分
+      linkadd: '<path d="M9.5 12.5a4 4 0 0 0 5.7.1l1.6-1.6a4 4 0 0 0-5.7-5.7l-.9.9"/><path d="M12.5 9.5a4 4 0 0 0-5.7-.1l-1.6 1.6a4 4 0 0 0 5.7 5.7l.9-.9"/><path d="M18 15v6M15 18h6"/>',
       del: '<path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/>'
     };
     const rowIcon = name => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ROW_ICON[name] || "") + '</svg>';
@@ -583,7 +605,8 @@
               <button class="icon-btn remark-account-btn" data-openid="${escapeHTML(account.openid)}" data-remark="${escapeHTML(account.remark || "")}" title="设置备注" aria-label="设置 ${escapeHTML(name)} 的备注">${rowIcon("remark")}</button>
               <button class="icon-btn status-account-btn" data-openid="${escapeHTML(account.openid)}" data-status="${escapeHTML(account.status || "")}" data-name="${escapeHTML(name)}" title="手动修正状态" aria-label="修正 ${escapeHTML(name)} 的状态">${rowIcon("status")}</button>
               <button class="icon-btn proxy-account-btn" data-id="${escapeHTML(String(account.id ?? ""))}" data-openid="${escapeHTML(account.openid)}" title="管理代理" aria-label="管理 ${escapeHTML(name)} 的代理">${rowIcon("proxy")}</button>
-              <button class="icon-btn link-account-btn" data-openid="${escapeHTML(account.openid)}" title="生成更新链接（一次性扫码）" aria-label="生成 ${escapeHTML(name)} 的更新链接">${rowIcon("link")}</button>
+              <button class="icon-btn link-account-btn" data-openid="${escapeHTML(account.openid)}" data-kind="update" title="生成更新链接：用原微信扫码，换掉这个账号的授权" aria-label="生成 ${escapeHTML(name)} 的更新链接">${rowIcon("link")}</button>
+              <button class="icon-btn addlink-account-btn" data-openid="${escapeHTML(account.openid)}" data-kind="add" title="生成新增链接：用别人的微信扫码，新增一个账号" aria-label="生成 ${escapeHTML(name)} 渠道的新增链接">${rowIcon("linkadd")}</button>
               <button class="icon-btn dangerish delete-account-btn" data-openid="${escapeHTML(account.openid)}" data-name="${escapeHTML(name)}" title="删除账号" aria-label="删除 ${escapeHTML(name)}">${rowIcon("del")}</button>
             </span>
           </td>`;
@@ -661,7 +684,7 @@
           if (e.target.closest(".remark-account-btn")) return;
           if (e.target.closest(".status-account-btn")) return;
           if (e.target.closest(".proxy-account-btn")) return;
-          if (e.target.closest(".link-account-btn")) return;
+          if (e.target.closest(".link-account-btn") || e.target.closest(".addlink-account-btn")) return;
           state.selectedOpenID = account.openid;
           syncSelectedAccount();
           setActivity(`已选择：${name}`);
@@ -682,12 +705,14 @@
           );
         });
 
-        row.querySelector(".link-account-btn").addEventListener("click", (e) => {
+        const openLinkDialog = (e) => {
           e.stopPropagation();
           const target = state.accounts.find(a => a.openid === e.currentTarget.dataset.openid);
           if (!target) { toast("账号已不存在，请刷新列表", "error"); return; }
-          openAccountLinkDialog(target);
-        });
+          openAccountLinkDialog(target, e.currentTarget.dataset.kind || "update");
+        };
+        row.querySelector(".link-account-btn").addEventListener("click", openLinkDialog);
+        row.querySelector(".addlink-account-btn").addEventListener("click", openLinkDialog);
 
         row.querySelector(".delete-account-btn").addEventListener("click", (e) => {
           e.stopPropagation();
@@ -716,16 +741,23 @@
       return product === "pcmgr" ? "腾讯电脑管家" : "应用宝";
     }
 
-    function openAccountLinkDialog(account) {
+    // kind=update：用原微信扫码，换掉这个账号的授权；
+    // kind=add：让别人的微信扫码，新增一个账号（这个账号只作为渠道/代理的参照）。
+    function openAccountLinkDialog(account, kind = "update") {
+      const isAdd = kind === "add";
       const source = account.scan_product === "pcmgr" ? "pcmgr" : "appstore";
       const overlay = document.createElement("div");
       overlay.className = "modal-overlay";
       overlay.innerHTML = `
         <div class="modal" style="max-width:520px">
-          <h4>生成更新链接 · ${escapeHTML(accountName(account))}</h4>
+          <h4>${isAdd ? "生成新增链接" : "生成更新链接"} · ${escapeHTML(accountName(account))}</h4>
           <p style="margin:6px 0 12px;color:var(--muted);font-size:12px;line-height:1.6">
-            链接只能用一次，生成后 10 分钟内有效。打开链接的人<b>不需要</b>登录控制台，
-            但必须用这个账号对应的微信扫码：换用其他微信号不会被接受，账号也不会被改动。
+            ${isAdd
+              ? `链接只能用一次，生成后 30 分钟内有效。打开链接的人<b>不需要</b>登录控制台，
+                 用<b>他自己的微信</b>扫码即可新增一个账号——当前这个账号不会被改动，只用来确定渠道与默认出口。
+                 扫出来的 OpenID 如果已经存在，会被拒绝，不会产生重复账号。`
+              : `链接只能用一次，生成后 10 分钟内有效。打开链接的人<b>不需要</b>登录控制台，
+                 但必须用这个账号对应的微信扫码：换用其他微信号不会被接受，账号也不会被改动。`}
           </p>
           <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px">扫码渠道</label>
           <select class="input" id="linkProduct" style="width:100%;margin-bottom:10px">
@@ -761,7 +793,8 @@
       select.value = source;
 
       const syncWarn = () => {
-        const switching = select.value !== source;
+        // add 只是给「新账号」选渠道，不会替换当前账号的身份，所以不弹切换警告。
+        const switching = !isAdd && select.value !== source;
         warn.classList.toggle("hidden", !switching);
         // 已经生成过链接后换渠道，必须重新生成：链接里锁定的是签发时的渠道。
         if (!result.classList.contains("hidden") && switching) {
@@ -782,7 +815,11 @@
         createBtn.disabled = true;
         createBtn.classList.add("loading");
         try {
-          const res = await api("POST", "/api/account-links", {
+          const res = await api("POST", "/api/account-links", isAdd ? {
+            kind: "add",
+            ref: account.openid,
+            product,
+          } : {
             kind: "update",
             ref: account.openid,
             product,
@@ -794,7 +831,7 @@
           const box = overlay.querySelector("#linkExisting");
           box.classList.add("hidden");
           createBtn.textContent = "重新生成";
-          toast(res.switched ? `已生成切换渠道的更新链接` : "已生成更新链接", "success");
+          toast(isAdd ? "已生成新增链接" : (res.switched ? "已生成切换渠道的更新链接" : "已生成更新链接"), "success");
         } catch (e) {
           // 409 表示这个账号上已经有一条没用完的链接。把它列出来并提供作废，
           // 否则运营者只能等到过期，期间完全不知道该用哪一条。
@@ -817,7 +854,7 @@
                 try {
                   await api("POST", `/api/account-links/${btn.dataset.id}/revoke`);
                   toast("已作废旧链接", "success");
-                  await openAccountLinkDialogAfterRevoke(overlay, account);
+                  await openAccountLinkDialogAfterRevoke(overlay, account, kind);
                 } catch (err) { btn.disabled = false; toast(`作废失败: ${err.message}`, "error"); }
               });
             });
@@ -832,9 +869,9 @@
     }
 
     // 作废旧链接后把对话框换新，避免用户停留在过期的按钮状态上。
-    async function openAccountLinkDialogAfterRevoke(overlay, account) {
+    async function openAccountLinkDialogAfterRevoke(overlay, account, kind) {
       overlay.remove();
-      openAccountLinkDialog(account);
+      openAccountLinkDialog(account, kind);
     }
 
     /* ========== 合并账号 ========== */
@@ -1213,6 +1250,7 @@
         const accounts = await api("GET", "/accounts");
         state.accounts = accounts;
         renderAccounts();
+        selectAccountFromURL();
         setActivity(background ? `已更新 ${accounts.length} 个账号` : `已加载 ${accounts.length} 个账号`);
       } catch (e) {
         if (background) {
@@ -1475,6 +1513,8 @@
     $("changePwdBtn").addEventListener("click", changePassword);
     $("compactBtn").addEventListener("click", compactAccounts);
     $("repairBtn").addEventListener("click", repairAccounts);
+    // 浏览器前进/后退：URL 指了哪个账号就切到哪个账号（视图滚动由外壳负责）。
+    window.addEventListener("popstate", selectAccountFromURL);
 
     /* ========== 启动 ========== */
     // 先确认管理员会话有效，再加载账号等敏感数据
@@ -1485,11 +1525,13 @@
       for (const step of [loadHealth, loadFeatures, loadAccounts, loadWebhook]) {
         try { await step(); } catch (e) { console.warn("启动步骤失败", e); }
       }
+      // 只在首屏按 ?focus= 定位一次；之后的后台刷新不抢用户的滚动位置。
+      scrollToWorkspaceFocus();
       setInterval(loadHealth, 15000);
     })();
   </script>
   <!-- 外壳放在页面脚本之后：先把 #pageActions 里的按钮绑定好，再整体搬进顶栏，
        这样页面逻辑完全不用关心自己最终显示在哪一层容器里。 -->
-  <script src="/static/js/platform.js?v=20261030-ui3"></script>
+  <script src="/static/js/platform.js?v=20261030-ui4"></script>
 </body>
 </html>

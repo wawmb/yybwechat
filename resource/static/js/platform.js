@@ -156,6 +156,42 @@
     sidebar.querySelector('a[aria-current="page"]')?.focus();
   };
   mobile.addEventListener("change", closeNav);
+
+  // 「我的控制台 / 我的微信账号 / 接口测试」是同一个工作台的三个视图（/?focus=…）。
+  // 侧栏里它们是普通的 <a href>，直接跳会整页重载，把选中账号、目标 AppID、
+  // 填好的请求参数和进行中的请求全部冲掉——上游 v0.2.54 修的就是这个：
+  // 同文档内切换，只改地址栏、顶栏标题与高亮，再滚到对应区块。
+  const focusWorkspace = () => {
+    if (location.pathname !== "/") return;
+    const focus = new URLSearchParams(location.search).get("focus");
+    const context = { accounts: ["我的微信账号", "账号与有效期"], test: ["接口测试", "协议能力调用"] }[focus] || pages["/"];
+    shell.querySelector(".platform-page-title").textContent = context[0];
+    shell.querySelector(".platform-breadcrumb").textContent = `YYB WeChat / ${context[1]}`;
+    shell.querySelectorAll(".platform-nav a").forEach(link => {
+      if (active(link.getAttribute("href"))) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+    const target = focus === "accounts" ? document.getElementById("accountWorkspace")
+      : focus === "test" ? document.getElementById("callWorkspace") : main;
+    if (target) target.scrollIntoView({ block: "start" });
+  };
+  sidebar.addEventListener("click", event => {
+    const link = event.target.closest("a");
+    // 修饰键点击、新窗口、下载、跨页面一律交给浏览器默认行为，不拦截。
+    if (!link || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey
+      || link.target || link.hasAttribute("download") || location.pathname !== "/") return;
+    const target = new URL(link.href);
+    if (target.origin !== location.origin || target.pathname !== "/") return;
+    // 已带的 ?ref= 要跟着走，否则前进/后退会丢掉当前账号。
+    const ref = new URLSearchParams(location.search).get("ref");
+    if (ref) target.searchParams.set("ref", ref);
+    event.preventDefault();
+    if (target.href !== location.href) history.pushState(null, "", target.pathname + target.search + target.hash);
+    closeNav();
+    focusWorkspace();
+  });
+  window.addEventListener("popstate", focusWorkspace);
+
   shell.querySelectorAll(".platform-nav a").forEach(link => link.addEventListener("click", closeNav));
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && document.body.classList.contains("platform-nav-open")) closeNav();

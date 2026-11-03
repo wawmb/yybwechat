@@ -596,6 +596,84 @@ func TestQRStatusTerminalDropsSession(t *testing.T) {
 	}
 }
 
+// TestCancelledQRSessionPollsAsCancelled 验证「用户主动取消」与「正常回收」在轮询结果上的区别。
+//
+// 前端 scan 流程、OpenAPI 的 status 枚举、qrStatusTerminal 都认 "cancelled"，
+// 但在这个标记补上之前后端从来没产生过它：用户点「重新生成」后，迟到的 poll
+// 只会拿到 404 "qr session not found"，看起来像二维码过期了，而实际上是他自己刷新的。
+//
+// 反面同样要守住：确认成功、过期清理走的是 dropQRSession，删的也是同一个表项，
+// 但绝不能因此被报成「用户取消」，否则刚注册成功的轮询会被当成失败收尾。
+func TestCancelledQRSessionPollsAsCancelled(t *testing.T) {
+	// 走真实路由而不是直接调 handler：cancel 分支是本轮新加的，
+	// 只测 handler 会漏掉「路由没挂上」这种接线问题。
+	app, cookie := newAuthenticatedApp(t)
+
+	put := func(id string) {
+		app.mu.Lock()
+		app.qrSessions[id] = &qr.Session{ID: id}
+		app.mu.Unlock()
+	}
+	// 只对已被回收的会话发起 poll：会话还在的话会真的去打微信侧。
+	call := func(method, id, action string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/qr/"+id+"/"+action, nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		app.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	pollStatus := func(id string) (int, string) {
+		rec := call(http.MethodGet, id, "poll")
+		if rec.Code != http.StatusOK {
+			return rec.Code, ""
+		}
+		// 统一响应封装：{code,msg,data:{session_id,status}}
+		var env struct {
+			Data struct {
+				Status string `json:"status"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("poll 响应不是合法 JSON: %v (%s)", err, rec.Body.String())
+		}
+		return rec.Code, env.Data.Status
+	}
+
+	// 主动取消：会话立刻退役，迟到的 poll 拿到明确的 cancelled
+	put("sess-cancel")
+	if rec := call(http.MethodPost, "sess-cancel", "cancel"); rec.Code != http.StatusOK {
+		t.Fatalf("cancel 返回 %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if app.getQRSession("sess-cancel") != nil {
+		t.Fatalf("取消后会话仍在内存里，迟到的 confirm 会把上一张二维码补完")
+	}
+	if code, status := pollStatus("sess-cancel"); code != http.StatusOK || status != "cancelled" {
+		t.Fatalf("取消后 poll = (%d, %q), want (200, cancelled)", code, status)
+	}
+
+	// 从没见过的会话不能被这个标记兜住，仍要报不存在
+	if code, _ := pollStatus("sess-never-seen"); code != http.StatusNotFound {
+		t.Fatalf("未知会话 poll = %d, want 404", code)
+	}
+
+	// 确认成功路径只回收，不产生 cancelled
+	put("sess-confirmed")
+	app.dropQRSession("sess-confirmed")
+	if code, _ := pollStatus("sess-confirmed"); code != http.StatusNotFound {
+		t.Fatalf("确认回收后的 poll = %d, want 404（不能被报成用户取消）", code)
+	}
+
+	// 标记只为迟到几百毫秒的 poll 服务，超出窗口照样按不存在处理
+	put("sess-stale")
+	call(http.MethodPost, "sess-stale", "cancel")
+	app.mu.Lock()
+	app.qrCancelled["sess-stale"] = time.Now().Add(-2 * time.Minute)
+	app.mu.Unlock()
+	if code, _ := pollStatus("sess-stale"); code != http.StatusNotFound {
+		t.Fatalf("过期标记 poll = %d, want 404", code)
+	}
+}
+
 // TestQRProxyRequested 判断请求体是否要求指定代理。
 //
 // 关键是「不能静默降级」：写了 mode 就必须走代理分支让后端校验，

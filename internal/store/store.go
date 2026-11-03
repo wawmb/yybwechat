@@ -331,6 +331,10 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err = migrateAccountLinksColumns(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err = migrateAddStatusNotified(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -1038,6 +1042,21 @@ func (db *DB) GetSetting(ctx context.Context, key string) (string, error) {
 		return "", nil
 	}
 	return value, err
+}
+
+// EnsureSetting 只在 key 不存在时写入 value，然后返回最终生效的值。
+//
+// 用于「实例级、只需生成一次」的随机种子（例如设备标识种子）：多个进程共用
+// 同一个库时，谁先写谁的值生效，后来者读回同一份，保证全实例口径一致。
+// 用 SetSetting 会互相覆盖，那就等于每个进程一套种子。
+func (db *DB) EnsureSetting(ctx context.Context, key, value string) (string, error) {
+	if _, err := db.sql.ExecContext(ctx,
+		"INSERT INTO settings(key, value, updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING",
+		key, value, time.Now().Unix(),
+	); err != nil {
+		return "", err
+	}
+	return db.GetSetting(ctx, key)
 }
 
 // SetSetting 插入或更新 settings 表中的键值对。

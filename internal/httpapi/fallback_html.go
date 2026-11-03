@@ -143,6 +143,27 @@ code{padding:2px 6px;border-radius:5px;background:#f1f5f9;font-size:12px}
 </div>
 </html>`
 
+// fallbackAccountLinksHTML 是「已激活短链接」页的内嵌后备 HTML。
+// 只在 resource/templates/account-links.html 缺失时使用。
+const fallbackAccountLinksHTML = `<!doctype html><html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>已激活短链接 · yybwechat</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7f9;color:#1f2933;font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+.box{max-width:520px;padding:32px;border:1px solid #e3e8ef;border-radius:14px;background:#fff}
+h1{margin:0 0 10px;font-size:18px;font-weight:600}
+p{margin:0 0 18px;color:#5b6b7c}
+a{display:inline-block;padding:8px 16px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none}
+code{padding:2px 6px;border-radius:5px;background:#f1f5f9;font-size:12px}
+</style>
+<div class="box">
+<h1>已激活短链接页模板缺失</h1>
+<p>未找到 <code>resource/templates/account-links.html</code>，因此无法渲染完整界面。请确认资源目录挂载正确后重启服务。</p>
+<p>接口仍可直接调用：<code>GET /api/account-links</code>。</p>
+<a href="/">返回控制台</a>
+</div>
+</html>`
+
 // fallbackLoginHTML 是登录页的内嵌后备 HTML。
 const fallbackLoginHTML = `<!doctype html><html lang="zh-CN">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

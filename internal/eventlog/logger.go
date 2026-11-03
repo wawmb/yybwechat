@@ -33,18 +33,41 @@ var catalog = map[string]definition{
 	"protocol.failed":            {"protocol", "error", "协议调用失败"},
 	"protocol.recovery_started":  {"protocol", "info", "开始恢复取码会话"},
 	"protocol.recovery_deferred": {"protocol", "debug", "取码恢复处于退避期"},
+	"protocol.recovery_skipped":  {"protocol", "debug", "取码恢复已跳过：会话刚验证成功"},
 	"protocol.ticket_requested":  {"protocol", "info", "请求新的登录票据"},
 	"protocol.recovered":         {"protocol", "info", "新会话取码验证通过"},
 	"protocol.native_started":    {"protocol", "info", "开始独立会话密钥恢复"},
 	"protocol.native_failed":     {"protocol", "error", "独立会话密钥恢复失败"},
 	"protocol.native_rotated":    {"protocol", "info", "独立会话密钥已轮换保存"},
 	"protocol.native_incomplete": {"protocol", "warn", "密钥已保存，传输状态尚未恢复"},
-	"protocol.native_fallback":   {"protocol", "warn", "原生恢复被拒，改用新票据重建会话"},
+	"protocol.circuit_open":      {"protocol", "warn", "已熔断，暂停向上游重复请求"},
+	"protocol.circuit_deferred":  {"protocol", "debug", "请求处于熔断期，未发往上游"},
+	"protocol.paced":             {"protocol", "info", "取码限速：部分请求已排队或被暂缓"},
+	"protocol.login_limited":     {"protocol", "warn", "重新登录次数已达上限，部分请求未再恢复会话"},
 	"keepalive.failed":           {"keepalive", "error", "后台凭据续期失败"},
 	"keepalive.renewed":          {"keepalive", "info", "后台凭据续期完成"},
 	"account.expired":            {"account", "warn", "账号授权失效，需重新扫码"},
 	"account.scanned":            {"account", "info", "扫码授权已保存"},
+	"account.refreshed":          {"account", "info", "凭据已按需或手动刷新"},
+	"account.refresh_failed":     {"account", "warn", "凭据按需或手动刷新失败"},
+	"account.notified":           {"account", "info", "已推送掉线提醒"},
+	"account.notify_failed":      {"account", "warn", "掉线提醒推送失败"},
 }
+
+// 协议请求类型：事件与取码熔断都要能区分「取码」和「取号 / 转发」，
+// 否则取号被拒会把同 AppID 的取码一起熔断掉。
+const (
+	OpGetCode        = "get_code"
+	OpGetPhoneNumber = "get_phone_number"
+	OpOperateWXData  = "operate_wx_data"
+)
+
+// 非后台循环触发的凭据刷新来源。后台循环自己发 keepalive.* 事件，
+// 不在这里标记，这样「后台续期」与「按需/手动刷新」可以分开统计。
+const (
+	SourceOnDemand = "on_demand"
+	SourceManual   = "manual"
+)
 
 type Rejection struct {
 	Stage      string `json:"stage"`
@@ -61,6 +84,27 @@ type Fields struct {
 	DurationMS int64       `json:"duration_ms,omitempty"`
 	Rejections []Rejection `json:"rejections,omitempty"`
 	Count      uint64      `json:"count,omitempty"`
+	// Waited / Refused 汇总一段突发里被排队或被挡下的请求数。
+	// 限速按「一次突发一条事件」上报，否则高峰期一分钟能刷出几百行。
+	Waited    uint64 `json:"waited,omitempty"`
+	Refused   uint64 `json:"refused,omitempty"`
+	AppID     string `json:"app_id,omitempty"`
+	Operation string `json:"operation,omitempty"`
+	API       string `json:"api,omitempty"`
+	Source    string `json:"source,omitempty"`
+}
+
+// WithSource 记录这次凭据刷新是被谁触发的。
+func (f Fields) WithSource(source string) Fields {
+	f.Source = source
+	return f
+}
+
+// WithTarget 记录这次事件针对哪个 AppID、哪类请求。
+// 排查连续 -14 时必须能看出「哪些目标被拒」，只记「被拒了」没有用。
+func (f Fields) WithTarget(appID, operation, api string) Fields {
+	f.AppID, f.Operation, f.API = appID, operation, api
+	return f
 }
 
 func ForAccount(acc *store.WechatAccount) Fields {
@@ -77,9 +121,27 @@ func ForAccount(acc *store.WechatAccount) Fields {
 // Routes are router templates, never the requested URL or account-link token.
 var safeRoute = regexp.MustCompile(`^/[a-zA-Z0-9_/*:-]{0,100}$`)
 
+// AppID 与小程序接口名是公开标识，但它们来自请求体，所以只允许纯标识文本落库。
+var (
+	safeAppID   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,40}$`)
+	safeAPIName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,39}$`)
+)
+
+func safeSource(source string) bool {
+	return source == SourceOnDemand || source == SourceManual
+}
+
+func safeOperation(op string) bool {
+	switch op {
+	case OpGetCode, OpGetPhoneNumber, OpOperateWXData:
+		return true
+	}
+	return false
+}
+
 func safeStage(stage string) bool {
 	switch stage {
-	case "refresh_token", "check_login", "login_buffer", "manual_auth", "native_autoauth_transport", "native_autoauth_application", "native_autoauth_business", "shortlink_transport", "shortlink_application", "pcmgr_login_buffer", "pcmgr_key_renewal":
+	case "refresh_token", "check_login", "login_buffer", "manual_auth", "native_autoauth_transport", "native_autoauth_application", "native_autoauth_business", "shortlink_transport", "shortlink_application", "pcmgr_login_buffer", "pcmgr_key_renewal", "circuit_target", "circuit_session":
 		return true
 	}
 	return false
@@ -132,6 +194,18 @@ func (l *Logger) Emit(event string, f Fields) {
 		}
 	}
 	f.Rejections = clean
+	if !safeAppID.MatchString(f.AppID) {
+		f.AppID = ""
+	}
+	if !safeOperation(f.Operation) {
+		f.Operation = ""
+	}
+	if !safeAPIName.MatchString(f.API) {
+		f.API = ""
+	}
+	if !safeSource(f.Source) {
+		f.Source = ""
+	}
 	raw, _ := json.Marshal(f)
 	item := store.SystemLog{CreatedAt: time.Now().UnixMilli(), Level: d.level, Category: d.category, Event: event, Message: d.message, AccountID: f.AccountID, Channel: f.Channel, Details: raw}
 	l.mu.RLock()

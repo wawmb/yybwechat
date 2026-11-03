@@ -240,6 +240,9 @@
     const $ = id => document.getElementById(id);
     const QR_TTL = 180; // 倒计时展示用，服务端实际会话有效期见 QRSessionTTL (5min)
     let sid = null, pollTimer = null, cdTimer = null, secsLeft = 0, confirming = false, settleTimer = null;
+    // 代际号：每次「重新生成」自增。await 期间的旧 poll 回来时用它判断自己是否已过期，
+    // 否则旧会话的结论（尤其是 cancelled）会把新一张二维码的状态覆盖掉。
+    let generation = 0;
 
     function escapeHTML(value) {
       return String(value ?? "")
@@ -432,7 +435,19 @@
 
     async function newQR() {
       if (confirming) return;
+      const gen = ++generation;
       stopTimers();
+
+      // 旧会话必须先退役：它没碰过账号库，但留着的会话会让一个迟到的
+      // poll / confirm 把上一张二维码的扫码结果补完，用户看到的是
+      // 「我明明刷新了，怎么还注册了刚才那个号」。
+      const previous = sid;
+      sid = null;
+      if (previous) {
+        try { await api("POST", `/qr/${previous}/cancel`); } catch {}
+        if (gen !== generation) return;
+      }
+
       resetUI();
       setStatus("正在获取二维码…", "pending", false);
 
@@ -453,20 +468,30 @@
 
       try {
         const r = payload ? await api("POST", "/qr", payload) : await api("POST", "/qr");
+        if (gen !== generation) {
+          // 请求飞行期间用户又点了一次「重新生成」：这张码已经没人看了，直接退役。
+          api("POST", `/qr/${r.session_id}/cancel`).catch(() => {});
+          return;
+        }
         sid = r.session_id;
         showQR(r.image_url);
         setStatus("等待扫码", "pending", true);
         startCountdown();
         pollTimer = setInterval(poll, 1500);
       } catch (e) {
+        if (gen !== generation) return;
         setStatus("获取失败：" + (e.message || "未知错误"), "error", false);
       }
     }
 
     async function poll() {
       if (!sid || confirming) return;
+      const gen = generation, current = sid;
       let st;
-      try { st = await api("GET", `/qr/${sid}/poll`); } catch { return; }
+      try { st = await api("GET", `/qr/${current}/poll`); } catch { return; }
+      // 这次轮询在飞的时候用户可能已经点了「重新生成」，旧的结论（cancelled / expired）
+      // 不能再往界面上写，否则新二维码刚显示出来就被上一张的状态覆盖掉。
+      if (gen !== generation || current !== sid) return;
 
       switch (st.status) {
         case "pending":
@@ -555,6 +580,6 @@
 
     newQR();
   </script>
-  <script src="/static/js/platform.js?v=20261030-ui3"></script>
+  <script src="/static/js/platform.js?v=20261030-ui4"></script>
 </body>
 </html>

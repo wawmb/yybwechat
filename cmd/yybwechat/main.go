@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"yybwechat/internal/httpapi"
+	"yybwechat/internal/protocol"
 )
 
 // envOr 读取环境变量，不存在时返回默认值。
@@ -50,6 +51,33 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// defaultCodeMinGap 是同一账号两次上游请求的最小间隔。
+//
+// 这是个保守起点，不是测出来的安全值：唯一一次「仅靠成功取码就把授权打到
+// 失效」的现场大约是每秒 1.6 个请求。熔断只对失败反应、登录预算只对 OAuth
+// 调用反应，所以**一串成功的 code 能同时穿过两者**——间隔是唯一拦得住它的东西。
+const defaultCodeMinGap = 3 * time.Second
+
+// envDuration 读取 Go 时长（如 "3s" / "10m"）。
+//
+// "off" 与 "0" 都表示关闭该功能；空值或解析失败时保留默认值并明说一句，
+// 不静默换成一个用户没预期的数。
+func envDuration(key string, def time.Duration) time.Duration {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def
+	}
+	if strings.EqualFold(v, "off") {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		log.Printf("[config] 环境变量 %s 的值 %q 不是合法时长，使用默认值 %s", key, v, def)
+		return def
+	}
+	return d
 }
 
 // envBool 读取布尔环境变量，仅 "true"/"1"/"yes"/"on" 视为真。
@@ -128,6 +156,26 @@ func main() {
 		"管理员登录会话有效期(小时)")
 	protocolToken := flag.String("protocol-token", envOr("YYB_PROTOCOL_TOKEN", ""),
 		"/wxapp/* 的 Bearer 令牌，留空表示不校验")
+	deviceIdentity := flag.String("device-identity", envOr("YYB_DEVICE_IDENTITY", protocol.DeviceIdentityStable),
+		"设备标识策略：stable=每个账号固定一套设备（默认），random=每次登录换新设备（历史行为）")
+	asRefreshMode := flag.String("appstore-refresh-mode", envOr("YYB_APPSTORE_REFRESH_MODE", httpapi.ASRefreshLegacy),
+		"应用宝凭据续期入口：legacy_auth=历史 _auth 入口（默认），source=按来源的现有入口")
+	circuitBreaker := flag.Bool("circuit-breaker", envBool("YYB_CIRCUIT_BREAKER", true),
+		"取码熔断（默认开）：已确认被拒的目标/会话在本地直接返回 429，不再重复请求上游")
+	codeMinGap := flag.Duration("code-min-gap", envDuration("YYB_CODE_MIN_GAP", defaultCodeMinGap),
+		"同一账号两次发往上游的请求最小间隔（默认 3s）；0 或 off 关闭限速")
+	codeMaxWait := flag.Duration("code-max-wait", envDuration("YYB_CODE_MAX_WAIT", 20*time.Second),
+		"取码请求为排档期最多等待多久（默认 20s），超时本地返回 429")
+	loginBudget := flag.Int("login-budget", envInt("YYB_LOGIN_BUDGET", protocol.DefaultLoginBudget),
+		"同一账号在窗口内允许因业务请求触发的重新登录次数（默认 3）；0 或 off 关闭预算")
+	loginWindow := flag.Duration("login-window", envDuration("YYB_LOGIN_WINDOW", protocol.DefaultLoginWindow),
+		"登录预算的滑动窗口长度（默认 10m）")
+	notifyChannel := flag.String("notify-channel", envOr("YYB_NOTIFY_CHANNEL", ""),
+		"额外推送通道，可选 serverchan / pushplus；企业微信仍用控制台里的 Webhook 地址")
+	notifyToken := flag.String("notify-token", envOr("YYB_NOTIFY_TOKEN", ""),
+		"额外推送通道的令牌（Server酱 SendKey / PushPlus token）")
+	notifyTopic := flag.String("notify-topic", envOr("YYB_NOTIFY_TOPIC", ""),
+		"PushPlus 群组编码（可选，仅 pushplus 使用）")
 	cookieSecure := flag.Bool("cookie-secure", envBool("YYB_COOKIE_SECURE", false),
 		"为会话 Cookie 加 Secure 标记（HTTPS 部署时开启）")
 	trustProxy := flag.Bool("trust-proxy", envBool("YYB_TRUST_PROXY", false),
@@ -183,9 +231,22 @@ func main() {
 		SessionDuration:   time.Duration(*sessionHours) * time.Hour,
 		CookieSecure:      *cookieSecure,
 		ProtocolToken:     *protocolToken,
-		TrustProxy:        *trustProxy,
-		AdminUser:         adminUser,
-		AdminPassword:     adminPassword,
+		DeviceIdentity:    *deviceIdentity,
+		ASRefreshMode:     *asRefreshMode,
+
+		DisableCircuitBreaker: !*circuitBreaker,
+		CodeMinGap:            *codeMinGap,
+		CodeMaxWait:           *codeMaxWait,
+		LoginBudget:           *loginBudget,
+		LoginWindow:           *loginWindow,
+
+		NotifyChannel: *notifyChannel,
+		NotifyToken:   *notifyToken,
+		NotifyTopic:   *notifyTopic,
+
+		TrustProxy:    *trustProxy,
+		AdminUser:     adminUser,
+		AdminPassword: adminPassword,
 	}
 
 	// 口令恢复模式：不初始化 App、不打开业务库、不监听端口。

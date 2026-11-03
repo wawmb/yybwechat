@@ -38,6 +38,13 @@ const (
 	// 窗口内改用几十秒级的短退避，才有机会在过期前救回来。
 	keepAliveUrgentBackoff = 30 * time.Second
 
+	// keepAliveExpiredBackoff 是「凭据已经彻底过期」后的失败重试间隔。
+	//
+	// 与上面的紧急退避相反：续期窗口已经错过，再密集重试也只是把注定被拒的
+	// 请求反复发给上游。实测两个账号分别被重试了 81 次和 46 次仍全部失败，
+	// 所以这种情况压到 15 分钟一次。
+	keepAliveExpiredBackoff = 15 * time.Minute
+
 	// keepAliveUrgentWindow 是判定「是否已进入续期窗口」的提前量下限。
 	// 取默认提前量加一点余量：即便账号配了更长的提前量，也不会被当成紧急。
 	keepAliveUrgentWindow = 6 * time.Minute
@@ -196,7 +203,7 @@ func (a *App) keepAliveShouldSkip(acc *store.WechatAccount) bool {
 //
 // 这里只读数据库并推送，不做任何网络刷新：避免重启瞬间对所有账号发起连接风暴。
 func (a *App) pushStartupAlerts() {
-	if a.getWebhookURL() == "" {
+	if !a.notifyChannelsConfigured() {
 		return
 	}
 	ctx := context.Background()
@@ -255,13 +262,15 @@ func (a *App) keepAliveRefresh(acc *store.WechatAccount) {
 		log.Printf("[keepalive] 账号 %s (%s) 授权已被拒绝，仅保留已有协议会话，需重新扫码: %v",
 			deref(acc.Nickname), acc.OpenID, err)
 	default:
-		urgent := credentialsNearExpiry(acc, time.Now()) && !isPCMgrAccount(acc)
+		now := time.Now()
+		lapsed := credentialsLapsed(acc, now)
+		urgent := !lapsed && credentialsNearExpiry(acc, now) && !isPCMgrAccount(acc)
 		fields := eventlog.ForAccount(acc)
 		fields.Rejections = eventRejections(err)
 		a.events.Emit("keepalive.failed", fields)
-		a.markKeepAliveRetry(acc.ID, urgent)
-		log.Printf("[keepalive] 账号 %s (%s) 刷新失败，将退避重试（紧急=%v）: %v",
-			deref(acc.Nickname), acc.OpenID, urgent, err)
+		a.markKeepAliveRetryAfter(acc.ID, urgent, lapsed)
+		log.Printf("[keepalive] 账号 %s (%s) 刷新失败，将退避重试（紧急=%v 已过期=%v）: %v",
+			deref(acc.Nickname), acc.OpenID, urgent, lapsed, err)
 	}
 }
 
@@ -270,12 +279,25 @@ func (a *App) keepAliveRefresh(acc *store.WechatAccount) {
 // 连续失败时退避按 2 倍递增（5min → 10min → 20min …）并封顶在 keepAliveMaxDelay，
 // 避免长期失效的账号被高频重试而给微信侧造成压力。
 func (a *App) markKeepAliveRetry(accountID int64, urgent bool) {
+	a.markKeepAliveRetryAfter(accountID, urgent, false)
+}
+
+// markKeepAliveRetryAfter 在 urgent 之外再区分「凭据已经彻底过期」。
+//
+// 已经过期的凭据再去刷新，只是把一个注定被拒的请求重复发给上游：
+// 续期窗口已经错过了，密集重试换不来成功，只会给上游多记几次失败。
+// 这种情况一律压到 15 分钟，等运营者重新扫码或凭据被替换。
+func (a *App) markKeepAliveRetryAfter(accountID int64, urgent, lapsed bool) {
 	a.keepAliveMu.Lock()
 	defer a.keepAliveMu.Unlock()
 
 	fails := a.keepAliveFails[accountID] + 1
 	a.keepAliveFails[accountID] = fails
 
+	if lapsed {
+		a.keepAliveNext[accountID] = time.Now().Add(keepAliveExpiredBackoff)
+		return
+	}
 	if urgent {
 		// 窗口内不累积指数退避：每次失败都只等一小会儿就再试，
 		// 否则凭据会在等待期间直接过期，连一次补救机会都没有。
@@ -313,7 +335,7 @@ func (a *App) invalidateAccountSessions(ctx context.Context, accountID int64) {
 // 这是给控制台与协议接口使用的入口，内部复用 refreshAccount，
 // 因此状态变更同样会触发 Webhook 通知。
 func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) (status string, newLoginBuffer string, err error) {
-	status, _, err = a.refreshAccount(ctx, acc, true)
+	status, _, err = a.refreshAccountWithSource(withRefreshSource(ctx, eventlog.SourceManual), acc, true)
 	if status != "alive" {
 		return status, "", err
 	}
@@ -326,6 +348,33 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) (st
 		newLoginBuffer = latest.LoginBuffer
 	}
 	return status, newLoginBuffer, err
+}
+
+// refreshAccountWithSource 在 refreshAccount 之上补一条「谁触发的刷新」事件。
+//
+// 后台循环自己发 keepalive.renewed / keepalive.failed，不在这里记账；
+// 只有按需（业务调用失败后补救）与手动（面板/接口点刷新）才落
+// account.refreshed / account.refresh_failed。这样后台续期、按需刷新、
+// 票据重建与业务成功才能在运行日志里分别统计，而不是糊成一团。
+func (a *App) refreshAccountWithSource(ctx context.Context, acc *store.WechatAccount, force bool) (string, bool, error) {
+	source := refreshSource(ctx)
+	status, refreshed, err := a.refreshAccount(ctx, acc, force)
+	if source == "" {
+		return status, refreshed, err
+	}
+	fields := eventlog.ForAccount(acc).WithSource(source)
+	// 两件事可以同时发生：OAuth 那一步成功了（凭据确实续期了），
+	// 但后续取票据 / 建会话失败。以前写成 switch 只会记其中一条，
+	// 于是「续期成功但调用仍失败」在日志里看起来像根本没续上。
+	if refreshed {
+		a.events.Emit("account.refreshed", fields)
+	}
+	if err != nil {
+		failed := fields
+		failed.Rejections = eventRejections(err)
+		a.events.Emit("account.refresh_failed", failed)
+	}
+	return status, refreshed, err
 }
 
 // refreshAccount 是唯一的凭据刷新实现，返回状态、是否真的发生了续期，以及错误。
@@ -661,7 +710,7 @@ func (a *App) noteAlertWindowSkip(acc *store.WechatAccount, kind string, lastUni
 // 因此这里不看跃迁，只看当前状态：只要还是 expired 就会推，成功后记账，
 // 超过重提醒窗口仍未重新扫码就再推一次，直到账号恢复为止。
 func (a *App) alertExpired(acc *store.WechatAccount) {
-	if a.getWebhookURL() == "" {
+	if !a.notifyChannelsConfigured() {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -739,7 +788,7 @@ func (a *App) alertUnusableCredentials(acc *store.WechatAccount, status string) 
 //   - 2 小时窗口内已送达过 → 不发，避免每 60 秒一条；
 //   - 送达失败 → 不记账，下一轮扫描自然重试，等价于补推。
 func (a *App) pushRenewalAlert(acc *store.WechatAccount, status, reason string) {
-	if a.getWebhookURL() == "" {
+	if !a.notifyChannelsConfigured() {
 		return
 	}
 
@@ -1076,15 +1125,46 @@ func (a *App) accountRefreshAhead(ctx context.Context, accountID int64) (time.Du
 }
 
 // refreshCredentialsWithProxy 按代理配置「只续期」，不取票据。
-func (a *App) refreshCredentialsWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, proxyValue string, fallbackDirect bool) (protocol.LoginBufferCredentials, error) {
-	if proxyValue == "" {
-		return a.refreshCredentials(ctx, creds)
+func (a *App) refreshCredentialsWithProxy(ctx context.Context, creds protocol.LoginBufferCredentials, proxyValue string, fallbackDirect bool) (refreshed protocol.LoginBufferCredentials, err error) {
+	// 历史 `_auth` 入口是应用宝的兼容策略，既不改凭据来源标记，
+	// 也不影响腾讯电脑管家那套独立原生续期。
+	source := creds.RefreshBusinessID
+	legacy := a.cfg.ASRefreshMode == ASRefreshLegacy &&
+		(creds.Provider == "" || creds.Provider == "appstore") &&
+		(source == "" || source == "pc_yyb" || source == "pc_yyb_auth")
+	if legacy {
+		creds.RefreshBusinessID = "pc_yyb_auth"
+		// 刷新成功后把来源标记还原：调用方据此判断凭据属于哪条链路，
+		// 让它因为一次续期就变成另一个来源，会连带改变后续的分支选择。
+		defer func() {
+			if err == nil {
+				refreshed.RefreshBusinessID = source
+			}
+		}()
 	}
-	client, err := qr.NewClientWithProxy(a.cfg.RequestTimeout, proxyValue, fallbackDirect)
-	if err != nil {
-		return protocol.LoginBufferCredentials{}, err
+	refresh, checkLogin := a.refreshCredentials, a.checkLogin
+	if proxyValue != "" {
+		client, clientErr := qr.NewClientWithProxy(a.cfg.RequestTimeout, proxyValue, fallbackDirect)
+		if clientErr != nil {
+			return protocol.LoginBufferCredentials{}, clientErr
+		}
+		refresh, checkLogin = client.LoginBuffers().RefreshCredentials, client.LoginBuffers().CheckLogin
 	}
-	return client.LoginBuffers().RefreshCredentials(ctx, creds)
+	refreshed, err = refresh(ctx, creds)
+	// _auth 入口会把「扫码授权已被拒」包成一个含糊的 -109。不补一次官方
+	// check-login，账号永远拿不到明确结论（42007 → 需重扫），只会每 2 分钟
+	// 重试一次、永远停在 unknown——正式环境实测两个账号分别重试了 81 次和 46 次。
+	// 注意这是**同一个出口**上的一次校验，不是切到另一条刷新入口。
+	var rejected *protocol.RefreshRejectedError
+	if legacy && source != "pc_yyb_auth" && checkLogin != nil &&
+		errors.As(err, &rejected) && rejected.Code == paramsInvalidCode && ctx.Err() == nil {
+		checked, checkErr := checkLogin(ctx, creds)
+		if checkErr == nil {
+			return checked, nil
+		}
+		return protocol.LoginBufferCredentials{}, fmt.Errorf("%w; check login: %w", err, checkErr)
+	}
+	return refreshed, err
 }
 
 // fetchLoginBufferWithProxy 按代理配置取登录票据。proxyValue 为空时走直连客户端。
@@ -1178,6 +1258,22 @@ func credentialsNearExpiry(acc *store.WechatAccount, now time.Time) bool {
 		return false
 	}
 	return creds.ExpiresAt-now.Unix() <= int64(keepAliveUrgentWindow.Seconds())
+}
+
+// credentialsLapsed 判断凭据是否已经彻底过期（续期窗口已经错过）。
+//
+// 与 credentialsNearExpiry 的区别是方向：那边是「即将过期，抓紧续」，
+// 这边是「已经过期，密集重试没有意义」。管家的"有效期"是下次续期计划，
+// 不是 OAuth 到期，拿它当失效证据会误判，所以只对非管家账号生效。
+func credentialsLapsed(acc *store.WechatAccount, now time.Time) bool {
+	if acc == nil || acc.Credentials == nil {
+		return false
+	}
+	creds := protocol.CredentialsFromMap(acc.Credentials)
+	if creds.Provider == "pcmgr" || creds.ExpiresAt <= 0 {
+		return false
+	}
+	return creds.ExpiresAt <= now.Unix()
 }
 
 // isPCMgrAccount 判断账号是否走腾讯电脑管家渠道。

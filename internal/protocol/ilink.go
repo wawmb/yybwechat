@@ -114,8 +114,7 @@ func randomAppDeviceID() ([]byte, error) {
 func randomSessDevice() []byte {
 	mac := make([]byte, 6)
 	_, _ = rand.Read(mac)
-	mac[0] = (mac[0] | 0x02) & 0xfe
-	return []byte(fmt.Sprintf("%02X-%02X-%02X-%02X-%02X-%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]))
+	return formatSessDevice(mac)
 }
 
 func buildManualAuthRequest(loginBufferB64 string, appDeviceID []byte) ([]byte, error) {
